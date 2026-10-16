@@ -20,6 +20,15 @@ from config import get_random_api_credentials, SESSIONS_DIR
 
 logger = logging.getLogger("worker")
 
+_BALANCE_RE = re.compile(r"Баланс:\s*([0-9]+(?:[.,][0-9]+)?)", re.IGNORECASE)
+
+def parse_balance(text: str) -> Optional[float]:
+    """Возвращает число после 'Баланс:' или None, если его нет."""
+    match = _BALANCE_RE.search(text or "")
+    if not match:
+        return None
+    return float(match.group(1).replace(",", "."))
+
 async def random_delay(delay_min: float, delay_max: float):
     """Случайная задержка между действиями для защиты от спамблока."""
     await asyncio.sleep(random.uniform(delay_min, delay_max))
@@ -242,7 +251,8 @@ async def process_account_telethon(
         if alert_create:
             logger.warning(f"[{session_name}] Алерт бота: {alert_create}")
             alert_lower = alert_create.lower()
-            if "недостаточно" in alert_lower or "баланс: 0" in alert_lower or "0$" in alert_lower:
+            alert_balance = parse_balance(alert_create)
+            if "недостаточно" in alert_lower or (alert_balance is not None and alert_balance <= 0) or "0$" in alert_lower:
                 return "ERROR", f"На аккаунте нет баланса для чека: {alert_create}", None
 
         if not clicked_create:
@@ -254,7 +264,9 @@ async def process_account_telethon(
 
         # Проверка баланса в тексте сообщения
         msg_text = (resp_msg.text or "") if resp_msg else ""
-        if "Баланс: 0" in msg_text or "Баланс: 0.00" in msg_text or "Недостаточно" in msg_text:
+        balance = parse_balance(msg_text)
+        logger.info(f"[{session_name}] Распознанный баланс: {balance}")
+        if (balance is not None and balance <= 0) or "Недостаточно" in msg_text:
             return "ERROR", f"На аккаунте нулевой баланс: {msg_text[:60]}", None
 
         # --- 5. Отправка суммы чека ТЕКСТОМ В ЧАТ (например, 0.1) ---
