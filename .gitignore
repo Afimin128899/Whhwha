@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Database & Storage
+*.sqlite3
+*.sqlite
+*.db
+
+# Telethon & Secrets
+.env
+sessions/*.session
+sessions/*.session-journal
+
+# Logs
+*.log
+checks.txt
