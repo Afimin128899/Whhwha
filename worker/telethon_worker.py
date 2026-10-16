@@ -8,7 +8,6 @@ from urllib.parse import urlparse, parse_qs
 
 from telethon import TelegramClient
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import KeyboardButtonCallback
 from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
