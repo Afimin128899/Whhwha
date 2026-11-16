@@ -14,27 +14,61 @@ class WorkerManager:
         self.bot = bot
         self._task: asyncio.Task = None
         self._is_active = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._claim_lock = asyncio.Lock()
 
     async def start(self):
-        """Запуск фонового воркера."""
-        if self._is_active:
-            return False
-        self._is_active = True
-        await db.set_setting("is_running", "1")
-        self._task = asyncio.create_task(self._worker_loop())
-        logger.info("Менеджер воркеров запущен")
-        return True
+        """Запуск пяти параллельных обработчиков."""
+        async with self._lifecycle_lock:
+            if self._task and not self._task.done():
+                return False
+            await db.set_setting("is_running", "1")
+            self._is_active = True
+            self._task = asyncio.create_task(self._run_workers())
+            logger.info("Запущено до 5 параллельных сессий")
+            return True
 
     async def stop(self):
-        """Остановка фонового воркера."""
-        self._is_active = False
-        await db.set_setting("is_running", "0")
-        if self._task and not self._task.done():
-            self._task.cancel()
-        # Возвращаем сессии со статусом PROCESSING обратно в READY
-        await db.reset_processing_sessions()
-        logger.info("Менеджер воркеров остановлен")
-        return True
+        """Дождаться отключения всех клиентов перед сбросом очереди."""
+        async with self._lifecycle_lock:
+            self._is_active = False
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+            await db.set_setting("is_running", "0")
+            await db.reset_processing_sessions()
+            logger.info("Менеджер воркеров остановлен")
+            return True
+
+    async def _run_workers(self):
+        workers = [asyncio.create_task(self._worker_loop()) for _ in range(5)]
+        try:
+            await asyncio.gather(*workers)
+            if self._is_active and config.ADMIN_ID:
+                try:
+                    await self.bot.send_message(
+                        config.ADMIN_ID,
+                        f"{tg_emoji('check')} <b>Все сессии обработаны!</b>\n"
+                        "Очередь пуста. Загрузите новые сессии или проверьте статус в меню.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    logger.exception("Не удалось отправить уведомление админу")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка в группе воркеров")
+        finally:
+            self._is_active = False
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            await db.reset_processing_sessions()
+            await db.set_setting("is_running", "0")
 
     def is_running(self) -> bool:
         return self._is_active
@@ -50,26 +84,18 @@ class WorkerManager:
                     self._is_active = False
                     break
 
-                # Ищем сессию в статусе READY
-                session_name = await db.get_next_ready_session()
+                # Захват сессии защищён от повторной выдачи соседнему воркеру.
+                async with self._claim_lock:
+                    if not self._is_active:
+                        break
+                    session_name = await db.get_next_ready_session()
+                    if session_name:
+                        await db.update_session_status(
+                            session_name, "PROCESSING", "В процессе обработки..."
+                        )
                 if not session_name:
-                    logger.info("Все готовые сессии обработаны. Воркер переходит в режим ожидания.")
-                    if config.ADMIN_ID:
-                        try:
-                            await self.bot.send_message(
-                                config.ADMIN_ID,
-                                f"{tg_emoji('check')} <b>Все сессии обработаны!</b>\n"
-                                "Очередь пуста. Загрузите новые сессии или проверьте статус в меню.",
-                                parse_mode=ParseMode.HTML
-                            )
-                        except Exception as e:
-                            logger.error(f"Не удалось отправить уведомление админу: {e}")
-                    self._is_active = False
-                    await db.set_setting("is_running", "0")
                     break
 
-                # Переводим в статус PROCESSING
-                await db.update_session_status(session_name, "PROCESSING", "В процессе обработки...")
                 logger.info(f"Начата обработка сессии: {session_name}")
 
                 # Параметры выполнения
@@ -128,7 +154,7 @@ class WorkerManager:
 
         except asyncio.CancelledError:
             logger.info("Фоновая задача воркера была отменена")
-        except Exception as e:
-            logger.error(f"Ошибка в цикле воркера: {e}", exc_info=True)
-            self._is_active = False
-            await db.set_setting("is_running", "0")
+            raise
+        except Exception:
+            logger.exception("Ошибка в цикле воркера")
+            raise
