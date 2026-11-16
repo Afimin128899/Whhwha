@@ -101,3 +101,46 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager.is_running())
         self.assertEqual((await self.db.get_sessions_stats())['PROCESSING'], 0)
         self.bot.send_message.assert_not_awaited()
+
+    async def test_progress_every_ten_successfully_sent_checks(self):
+        for i in range(12, 25):
+            await self.db.add_session(str(i))
+
+        async def process(session_name, **kwargs):
+            return 'DONE', 'ok', 'https://t.me/example?start=' + session_name
+
+        with patch('worker.manager.process_account_telethon', process):
+            await self.manager.start()
+            await asyncio.wait_for(self.manager._task, 10)
+        progress = [call.args[1] for call in self.bot.send_message.await_args_list
+                    if call.args[1].startswith('Отправлено ')]
+        self.assertEqual(progress, ['Отправлено 10 чеков.', 'Отправлено 20 чеков.'])
+        self.assertEqual(self.manager._sent_checks, 25)
+        # A new worker run starts its own progress counter.
+        await self.manager.start()
+        await asyncio.wait_for(self.manager._task, 5)
+        self.assertEqual(self.manager._sent_checks, 0)
+
+    async def test_failed_sessions_and_deliveries_do_not_count(self):
+        async def process(session_name, **kwargs):
+            if session_name in ('0', '1'):
+                return 'ERROR', 'no check', None
+            return 'DONE', 'ok', 'https://t.me/example?start=' + session_name
+
+        failed = False
+
+        async def send_message(admin, text, **kwargs):
+            nonlocal failed
+            if 'Новый чек' in text and not failed:
+                failed = True
+                raise RuntimeError('delivery failed')
+
+        self.bot.send_message.side_effect = send_message
+        with patch('worker.manager.process_account_telethon', process):
+            with self.assertLogs('worker_manager', level='ERROR'):
+                await self.manager.start()
+                await asyncio.wait_for(self.manager._task, 10)
+        self.assertEqual(self.manager._sent_checks, 9)
+        progress = [call.args[1] for call in self.bot.send_message.await_args_list
+                    if call.args[1].startswith('Отправлено ')]
+        self.assertEqual(progress, [])
