@@ -14,6 +14,11 @@ class CheckLinkTests(unittest.TestCase):
         self.assertEqual(parse_check_link('https://t.me/OnoGo_bot?start=check_123-A'),
                          'check_123-A')
 
+    def test_selected_bot_from_actual_link(self):
+        self.assertEqual(parse_check_link('https://t.me/send?start=abc', 'send'), 'abc')
+        with self.assertRaises(ValueError):
+            parse_check_link('https://t.me/send?start=abc', 'OnoGo_bot')
+
     def test_other_targets_and_invalid_payloads_are_rejected(self):
         for url in (
             'https://t.me/other_bot?start=check',
@@ -72,3 +77,16 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
             await self.receiver.open_check(url)
         self.assertIn('неизвестен', await self.receiver.open_check(url))
         self.receiver.client.assert_awaited_once()
+
+    async def test_same_payload_in_different_bots_is_independent(self):
+        await self.receiver.open_check('https://t.me/OnoGo_bot?start=abc')
+        self.receiver.bot_username = 'send'
+        await self.receiver.open_check('https://t.me/send?start=abc')
+        self.assertEqual(self.receiver.client.await_count, 2)
+
+    async def test_legacy_journal_entry_prevents_duplicate_opening(self):
+        await self.receiver.ledger.execute("INSERT INTO opened_checks VALUES ('abc', 'SENT')")
+        await self.receiver.ledger.commit()
+        self.assertIn('уже отправлялась', await self.receiver.open_check(
+            'https://t.me/OnoGo_bot?start=abc'))
+        self.receiver.client.assert_not_awaited()

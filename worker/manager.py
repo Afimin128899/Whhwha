@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import os
+from html import escape
 from aiogram import Bot
 from aiogram.enums import ParseMode
 import config
 from database.db import db
 from worker.telethon_worker import process_account_telethon
 from bot.emojis import tg_emoji
-from worker.check_receiver import CheckReceiver
+from worker.check_receiver import CheckReceiver, receiver_setup_lock
 
 logger = logging.getLogger("worker_manager")
 
@@ -24,6 +25,8 @@ class WorkerManager:
     async def start(self):
         """Запуск пяти параллельных обработчиков."""
         async with self._lifecycle_lock:
+            if receiver_setup_lock.locked():
+                return False
             if self._task and not self._task.done():
                 return False
             await db.set_setting("is_running", "1")
@@ -51,7 +54,10 @@ class WorkerManager:
     async def _run_workers(self):
         workers = []
         try:
-            if os.getenv("CHECK_RECEIVER_ENABLED", "0") == "1":
+            receiver_enabled = await db.get_setting('check_receiver_enabled', '')
+            if receiver_enabled == '':
+                receiver_enabled = os.getenv('CHECK_RECEIVER_ENABLED', '0')
+            if receiver_enabled == '1':
                 self._receiver = CheckReceiver()
                 await self._receiver.connect()
             workers = [asyncio.create_task(self._worker_loop()) for _ in range(5)]
@@ -75,7 +81,7 @@ class WorkerManager:
                     await self.bot.send_message(
                         config.ADMIN_ID,
                         "Воркер остановлен из-за ошибки. Если включён получатель, "
-                        "проверь его авторизацию через login_receiver.py. Подробности в журнале VPS.",
+                        "проверь его в меню «Аккаунт-получатель». Подробности в журнале VPS.",
                     )
                 except Exception:
                     logger.exception("Не удалось сообщить об ошибке")
@@ -156,9 +162,14 @@ class WorkerManager:
                     if self._receiver is not None:
                         try:
                             receiver_note = await self._receiver.open_check(check_url)
-                        except Exception:
+                        except ValueError as exc:
+                            receiver_note = f'Ссылка не открыта: {escape(str(exc))}'
+                        except Exception as exc:
                             logger.exception("Ошибка открытия чека получателем")
-                            receiver_note = "Автоактивация не подтверждена. Проверь чек вручную."
+                            receiver_note = (
+                                f'Автооткрытие: {type(exc).__name__}. '
+                                'Зачисление не подтверждено. Проверь получателя в меню и чек вручную.'
+                            )
 
                     # Моментальное уведомление администратора
                     if config.ADMIN_ID:

@@ -2,10 +2,14 @@ from __future__ import annotations
 import os
 import io
 import re
+import asyncio
+from contextlib import suppress
+from html import escape
 from pathlib import Path
 from aiogram import Router, F, types, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import BufferedInputFile
 from aiogram.enums import ParseMode
 
@@ -30,13 +34,204 @@ from bot.keyboards import (
     get_back_cancel_keyboard,
     get_reset_confirm_keyboard
 )
-from bot.states import SettingsStates, AddSessionStates
+from bot.states import SettingsStates, AddSessionStates, ReceiverStates
 from bot.emojis import tg_emoji, emoji_id
+from worker.check_receiver import (
+    CheckReceiver, RECEIVER_DIR, RECEIVER_SESSION, RECEIVER_BOT, receiver_setup_lock,
+)
 
 router = Router()
+auth_isolation = SimpleEventIsolation()
+AUTH_TIMEOUT_SECONDS = 300
 
 # Временное хранилище Telethon клиентов в процессе авторизации (user_id -> TelegramClient)
 active_auth_clients: dict[int, TelegramClient] = {}
+receiver_auth_users: set[int] = set()
+auth_timeouts: dict[int, asyncio.Task] = {}
+
+
+async def cancel_auth(user_id: int):
+    timer = auth_timeouts.pop(user_id, None)
+    if timer and timer is not asyncio.current_task():
+        timer.cancel()
+    client = active_auth_clients.pop(user_id, None)
+    if client:
+        with suppress(Exception):
+            await client.disconnect()
+    if user_id in receiver_auth_users:
+        receiver_auth_users.discard(user_id)
+        try:
+            for suffix in ('', '-journal', '-wal', '-shm'):
+                (RECEIVER_DIR / f'pending_{user_id}.session{suffix}').unlink(missing_ok=True)
+        finally:
+            if receiver_setup_lock.locked():
+                receiver_setup_lock.release()
+
+
+async def close_auth_clients():
+    for user_id in set(active_auth_clients) | receiver_auth_users | set(auth_timeouts):
+        await cancel_auth(user_id)
+
+
+def schedule_auth_timeout(user_id: int, state: FSMContext):
+    previous = auth_timeouts.pop(user_id, None)
+    if previous:
+        previous.cancel()
+
+    async def expire():
+        await asyncio.sleep(AUTH_TIMEOUT_SECONDS)
+        async with auth_isolation.lock(key=state.key):
+            await cancel_auth(user_id)
+            await state.clear()
+
+    auth_timeouts[user_id] = asyncio.create_task(expire())
+
+
+async def delete_auth_input(message: types.Message):
+    with suppress(Exception):
+        await message.delete()
+
+
+def receiver_admin(user, chat) -> bool:
+    return bool(user and chat and chat.type == 'private'
+                and config.ADMIN_ID and user.id == config.ADMIN_ID)
+
+
+def receiver_keyboard():
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text='Войти по номеру', callback_data='receiver_login')],
+        [types.InlineKeyboardButton(text='Проверить подключение', callback_data='receiver_test')],
+        [types.InlineKeyboardButton(text='Бот из ссылки чека', callback_data='receiver_set_bot')],
+        [types.InlineKeyboardButton(text='Отключить автооткрытие', callback_data='receiver_disable')],
+        [types.InlineKeyboardButton(text='Назад', callback_data='menu_main')],
+    ])
+
+
+@router.callback_query(F.data == 'receiver_menu')
+async def cb_receiver_menu(callback: types.CallbackQuery, state: FSMContext):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Доступ только администратору в личном чате.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    await state.clear()
+    enabled = await db.get_setting('check_receiver_enabled', '')
+    if enabled == '':
+        enabled = os.getenv('CHECK_RECEIVER_ENABLED', '0')
+    account_id = await db.get_setting('check_receiver_account_id', '')
+    check_bot = await db.get_setting('check_receiver_bot', RECEIVER_BOT)
+    status = 'включено' if enabled == '1' else 'выключено'
+    saved = 'сохранена' if RECEIVER_SESSION.is_file() else 'не настроена'
+    await callback.message.answer(
+        f'Аккаунт-получатель\nАвтооткрытие: {status}. Сессия: {saved}.\n'
+        f'Telegram ID: {escape(account_id) if account_id else "пока неизвестен"}.\n\n'
+        f'Бот из ссылки чека: @{escape(check_bot)}.\n'
+        'Вход и проверка остановят воркер. После настройки запусти его снова.\n'
+        'Этот аккаунт не добавляется в рабочую очередь.', reply_markup=receiver_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == 'receiver_set_bot')
+async def cb_receiver_set_bot(callback: types.CallbackQuery, state: FSMContext):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Нет доступа.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    await state.clear()
+    await state.set_state(ReceiverStates.waiting_for_bot)
+    await callback.message.answer(
+        'Пришли только @username бота из самой ссылки чека — часть после t.me/ до ?start=.\n'
+        'Полную ссылку чека присылать не нужно. Например: @OnoGo_bot или @send.',
+        reply_markup=get_back_cancel_keyboard(to_where='receiver_menu'),
+    )
+    await callback.answer()
+
+
+@router.message(ReceiverStates.waiting_for_bot, F.text)
+async def process_receiver_bot(message: types.Message, state: FSMContext, worker_mgr: WorkerManager):
+    if not receiver_admin(message.from_user, message.chat):
+        return
+    username = message.text.strip().lstrip('@')
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}', username):
+        return await message.answer('Пришли только @username бота, без ссылки и start-параметра.')
+    async with receiver_setup_lock:
+        await worker_mgr.stop()
+        await db.set_setting('check_receiver_bot', username)
+    await state.clear()
+    await message.answer(
+        f'Бот из ссылки: @{escape(username)}. Нажми «Проверить подключение», затем запусти воркер.',
+        reply_markup=receiver_keyboard(),
+    )
+
+
+@router.callback_query(F.data == 'receiver_login')
+async def cb_receiver_login(callback: types.CallbackQuery, state: FSMContext, worker_mgr: WorkerManager):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Нет доступа.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    if receiver_setup_lock.locked():
+        return await callback.answer('Вход уже выполняется.', show_alert=True)
+    await receiver_setup_lock.acquire()
+    receiver_auth_users.add(callback.from_user.id)
+    try:
+        await worker_mgr.stop()
+        RECEIVER_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        RECEIVER_DIR.chmod(0o700)
+        for suffix in ('', '-journal', '-wal', '-shm'):
+            (RECEIVER_DIR / f'pending_{callback.from_user.id}.session{suffix}').unlink(missing_ok=True)
+        await state.clear()
+        await state.update_data(auth_target='receiver')
+        await state.set_state(AddSessionStates.waiting_for_phone)
+        schedule_auth_timeout(callback.from_user.id, state)
+        await callback.message.answer(
+            'Вход в твой аккаунт-получатель. Отправь номер с кодом страны.\n'
+            'На вход есть 5 минут. Предыдущий получатель сохранится до успешного входа.\n'
+            'Сообщения с номером, кодом и паролем бот попробует удалить после обработки.',
+            reply_markup=get_back_cancel_keyboard(to_where='receiver_menu'),
+        )
+        await callback.answer()
+    except BaseException:
+        await cancel_auth(callback.from_user.id)
+        await state.clear()
+        raise
+
+
+@router.callback_query(F.data == 'receiver_disable')
+async def cb_receiver_disable(callback: types.CallbackQuery, state: FSMContext, worker_mgr: WorkerManager):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Нет доступа.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    await worker_mgr.stop()
+    await db.set_setting('check_receiver_enabled', '0')
+    await cb_receiver_menu(callback, state)
+
+
+@router.callback_query(F.data == 'receiver_test')
+async def cb_receiver_test(callback: types.CallbackQuery, state: FSMContext, worker_mgr: WorkerManager):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Нет доступа.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    await state.clear()
+    await callback.answer('Проверяю подключение…')
+    receiver = CheckReceiver()
+    await receiver_setup_lock.acquire()
+    try:
+        await worker_mgr.stop()
+        await receiver.connect()
+        me = await receiver.client.get_me()
+        await callback.message.answer(
+            f'Получатель подключён: Telegram ID {me.id}. Бот чеков доступен.\n'
+            'Проверка не открывала чеки. Теперь можно запустить воркер.',
+            reply_markup=receiver_keyboard(),
+        )
+    except Exception as exc:
+        await callback.message.answer(
+            f'Подключение не удалось: {escape(type(exc).__name__)}.\n'
+            'Проверь авторизацию через «Войти по номеру».', reply_markup=receiver_keyboard(),
+        )
+    finally:
+        try:
+            await receiver.close()
+        finally:
+            receiver_setup_lock.release()
 
 async def check_admin(user: types.User) -> bool:
     """Проверка прав администратора по ID или username (@Iolzi)."""
@@ -73,6 +268,7 @@ async def cmd_start(message: types.Message, state: FSMContext, worker_mgr: Worke
         )
         return
 
+    await cancel_auth(message.from_user.id)
     await state.clear()
     is_running = worker_mgr.is_running()
     status_text = (
@@ -94,6 +290,7 @@ async def cb_menu_main(callback: types.CallbackQuery, state: FSMContext | None =
         return await callback.answer("Нет доступа", show_alert=True)
 
     if state is not None:
+        await cancel_auth(callback.from_user.id)
         await state.clear()
 
     is_running = worker_mgr.is_running() if worker_mgr else False
@@ -118,6 +315,9 @@ async def cb_worker_start(callback: types.CallbackQuery, state: FSMContext, work
     """Запуск воркера."""
     if not await check_admin(callback.from_user):
         return await callback.answer("Нет доступа", show_alert=True)
+
+    if receiver_setup_lock.locked():
+        return await callback.answer('Сначала заверши или отмени вход получателя.', show_alert=True)
 
     stats = await db.get_sessions_stats()
     if stats.get("READY", 0) == 0:
@@ -289,6 +489,7 @@ async def cb_menu_settings(callback: types.CallbackQuery, state: FSMContext):
     if not await check_admin(callback.from_user):
         return await callback.answer("Нет доступа", show_alert=True)
 
+    await cancel_auth(callback.from_user.id)
     await state.clear()
     settings = await db.get_all_settings()
     text = (
@@ -486,13 +687,9 @@ async def cb_add_session_phone(callback: types.CallbackQuery, state: FSMContext)
         return await callback.answer("Нет доступа", show_alert=True)
 
     # Закрываем предыдущую незавершенную попытку, если была
-    old_client = active_auth_clients.pop(callback.from_user.id, None)
-    if old_client:
-        try:
-            await old_client.disconnect()
-        except Exception:
-            pass
-
+    await cancel_auth(callback.from_user.id)
+    await state.clear()
+    schedule_auth_timeout(callback.from_user.id, state)
     await state.set_state(AddSessionStates.waiting_for_phone)
     text = (
         f"{tg_emoji('phone')} <b>Вход в аккаунт по номеру телефона</b>\n\n"
@@ -512,7 +709,15 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
     if not await check_admin(message.from_user):
         return
 
+    if not message.text:
+        return
+    data = await state.get_data()
+    is_receiver = data.get('auth_target') == 'receiver'
+    if is_receiver and not receiver_admin(message.from_user, message.chat):
+        return
     raw_phone = message.text.strip()
+    if is_receiver:
+        await delete_auth_input(message)
     digits = re.sub(r"\D", "", raw_phone)
     if len(digits) < 7 or len(digits) > 15:
         await message.answer(
@@ -523,6 +728,11 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
 
     phone_formatted = f"+{digits}"
     session_file = SESSIONS_DIR / f"{digits}.session"
+    if is_receiver:
+        if message.from_user.id not in receiver_auth_users:
+            await state.clear()
+            return await message.answer('Время входа истекло. Начни заново в меню получателя.')
+        session_file = RECEIVER_DIR / f'pending_{message.from_user.id}.session'
 
     api_id, api_hash = get_random_api_credentials()
     if not api_id or not api_hash:
@@ -530,6 +740,7 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
             f"{tg_emoji('cross')} В пуле нет валидных API_ID/API_HASH. Проверьте конфигурацию .env.",
             parse_mode=ParseMode.HTML
         )
+        await cancel_auth(message.from_user.id)
         await state.clear()
         return
 
@@ -537,11 +748,14 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
         str(session_file), api_id, api_hash,
         lang_code="en", system_lang_code="en-US",
     )
+    active_auth_clients[message.from_user.id] = client
     try:
         await client.connect()
+        if is_receiver and session_file.exists():
+            session_file.chmod(0o600)
         sent_code = await client.send_code_request(phone_formatted)
     except FloodWaitError as e:
-        await client.disconnect()
+        await cancel_auth(message.from_user.id)
         await state.clear()
         await message.answer(
             f"{tg_emoji('warning')} Telegram временно заблокировал отправку кода (FloodWait: {e.seconds} сек). Попробуйте позже.",
@@ -549,10 +763,10 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
         )
         return
     except Exception as e:
-        await client.disconnect()
+        await cancel_auth(message.from_user.id)
         await state.clear()
         await message.answer(
-            f"{tg_emoji('cross')} Ошибка отправки кода на {phone_formatted}: <code>{e}</code>",
+            f"{tg_emoji('cross')} Ошибка отправки кода: <code>{type(e).__name__}</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -567,7 +781,7 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
     await state.set_state(AddSessionStates.waiting_for_code)
 
     text = (
-        f"{tg_emoji('speaker')} <b>Код подтверждения отправлен на {phone_formatted}!</b>\n\n"
+        f"{tg_emoji('speaker')} <b>Код подтверждения запрошен!</b>\n\n"
         "Отправьте полученный код из Telegram или SMS.\n"
         "<i>💡 Если код пришел с пробелами (например, 123 45), можете отправить как есть.</i>"
     )
@@ -593,6 +807,12 @@ async def process_auth_code(message: types.Message, state: FSMContext, worker_mg
         return
 
     data = await state.get_data()
+    if not message.text:
+        return
+    if data.get('auth_target') == 'receiver':
+        if not receiver_admin(message.from_user, message.chat):
+            return
+        await delete_auth_input(message)
     phone_formatted = data.get("phone_formatted")
     phone_code_hash = data.get("phone_code_hash")
     phone_digits = data.get("phone_digits")
@@ -620,27 +840,35 @@ async def process_auth_code(message: types.Message, state: FSMContext, worker_mg
             parse_mode=ParseMode.HTML
         )
         return
-    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+    except PhoneCodeExpiredError:
+        await cancel_auth(message.from_user.id)
+        await state.clear()
+        keyboard = receiver_keyboard() if data.get('auth_target') == 'receiver' else get_main_keyboard(False)
+        await message.answer('Код истёк. Запроси новый через кнопку входа.', reply_markup=keyboard)
+        return
+    except PhoneCodeInvalidError:
         await message.answer(
-            f"{tg_emoji('cross')} Неверный код или срок его действия истек ({e}). Попробуйте ввести еще раз:",
+            f"{tg_emoji('cross')} Неверный код. Попробуйте ввести ещё раз:",
             parse_mode=ParseMode.HTML
         )
         return
     except Exception as e:
-        await client.disconnect()
-        active_auth_clients.pop(message.from_user.id, None)
+        await cancel_auth(message.from_user.id)
         await state.clear()
         await message.answer(
-            f"{tg_emoji('cross')} Ошибка входа: <code>{e}</code>",
+            f"{tg_emoji('cross')} Ошибка входа: <code>{type(e).__name__}</code>",
             parse_mode=ParseMode.HTML
         )
+        return
+
+    if data.get('auth_target') == 'receiver':
+        await finish_receiver_auth(message, state)
         return
 
     # Успешный вход без 2FA
     me = await client.get_me()
     name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-    await client.disconnect()
-    active_auth_clients.pop(message.from_user.id, None)
+    await cancel_auth(message.from_user.id)
     await state.clear()
 
     await db.add_session(phone_digits)
@@ -669,9 +897,15 @@ async def process_auth_password(message: types.Message, state: FSMContext, worke
         return
 
     data = await state.get_data()
+    if not message.text:
+        return
+    if data.get('auth_target') == 'receiver':
+        if not receiver_admin(message.from_user, message.chat):
+            return
+        await delete_auth_input(message)
     phone_formatted = data.get("phone_formatted")
     phone_digits = data.get("phone_digits")
-    password = message.text.strip()
+    password = message.text
 
     try:
         await client.sign_in(password=password)
@@ -682,20 +916,22 @@ async def process_auth_password(message: types.Message, state: FSMContext, worke
         )
         return
     except Exception as e:
-        await client.disconnect()
-        active_auth_clients.pop(message.from_user.id, None)
+        await cancel_auth(message.from_user.id)
         await state.clear()
         await message.answer(
-            f"{tg_emoji('cross')} Ошибка авторизации: <code>{e}</code>",
+            f"{tg_emoji('cross')} Ошибка авторизации: <code>{type(e).__name__}</code>",
             parse_mode=ParseMode.HTML
         )
+        return
+
+    if data.get('auth_target') == 'receiver':
+        await finish_receiver_auth(message, state)
         return
 
     # Успешный вход с 2FA
     me = await client.get_me()
     name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-    await client.disconnect()
-    active_auth_clients.pop(message.from_user.id, None)
+    await cancel_auth(message.from_user.id)
     await state.clear()
 
     await db.add_session(phone_digits)
@@ -707,3 +943,30 @@ async def process_auth_password(message: types.Message, state: FSMContext, worke
     )
     is_running = worker_mgr.is_running()
     await message.answer(text, reply_markup=get_main_keyboard(is_running), parse_mode=ParseMode.HTML)
+
+
+async def finish_receiver_auth(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    client = active_auth_clients[user_id]
+    try:
+        me = await client.get_me()
+        if not me or me.bot:
+            raise ValueError('Expected a user account')
+        await client.disconnect()
+        active_auth_clients.pop(user_id, None)
+        source = RECEIVER_DIR / f'pending_{user_id}.session'
+        os.replace(source, RECEIVER_SESSION)
+        RECEIVER_SESSION.chmod(0o600)
+        await db.set_setting('check_receiver_account_id', str(me.id))
+        await db.set_setting('check_receiver_enabled', '1')
+    except Exception as exc:
+        await message.answer(f'Не удалось сохранить получателя: {type(exc).__name__}. Повтори вход.')
+        return
+    finally:
+        await cancel_auth(user_id)
+        await state.clear()
+    await message.answer(
+        f'Получатель подключён: Telegram ID {me.id}. Автооткрытие включено.\n'
+        'Аккаунт сохранён отдельно от рабочей очереди. Запусти воркер в главном меню.',
+        reply_markup=receiver_keyboard(),
+    )

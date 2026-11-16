@@ -10,19 +10,25 @@ from telethon import TelegramClient
 from telethon.tl.functions.messages import StartBotRequest
 
 import config
+from database.db import db
 
 
 RECEIVER_DIR = config.BASE_DIR / "receiver"
 RECEIVER_SESSION = RECEIVER_DIR / "recipient.session"
 RECEIVER_BOT = "OnoGo_bot"
+# Held during interactive login so the worker cannot open the same session file.
+receiver_setup_lock = asyncio.Lock()
 
 
-def parse_check_link(url: str) -> str:
+def parse_check_link(url: str, bot_username: str = RECEIVER_BOT) -> str:
     parsed = urlsplit(url)
     if (parsed.scheme != "https" or parsed.netloc.lower() != "t.me"
-            or parsed.path.strip("/").lower() != RECEIVER_BOT.lower()
+            or parsed.path.strip("/").lower() != bot_username.lower()
             or parsed.fragment):
-        raise ValueError("Ожидалась ссылка чека https://t.me/OnoGo_bot?start=...")
+        raise ValueError(
+            f'Ссылка ведёт не на @{bot_username}. Укажи бота из ссылки '
+            'в меню «Аккаунт-получатель» → «Бот из ссылки чека».'
+        )
     params = parse_qs(parsed.query)
     payloads = params.get("start", [])
     if (set(params) != {"start"} or len(payloads) != 1
@@ -37,10 +43,11 @@ class CheckReceiver:
         self.ledger = None
         self.lock = asyncio.Lock()
         self.bot = None
+        self.bot_username = RECEIVER_BOT
 
     async def connect(self):
         if not RECEIVER_SESSION.is_file():
-            raise RuntimeError("Сначала выполни .venv/bin/python login_receiver.py на VPS.")
+            raise RuntimeError("Войди через меню «Аккаунт-получатель» в боте.")
         api_id, api_hash = config.get_random_api_credentials()
         if not api_id or not api_hash:
             raise RuntimeError("Не заданы API_ID/API_HASH.")
@@ -50,10 +57,11 @@ class CheckReceiver:
         )
         await self.client.connect()
         if not await self.client.is_user_authorized():
-            raise RuntimeError("Авторизация получателя сброшена. Повтори login_receiver.py.")
-        self.bot = await self.client.get_entity(RECEIVER_BOT)
+            raise RuntimeError("Авторизация получателя сброшена. Повтори вход в меню бота.")
+        self.bot_username = await db.get_setting('check_receiver_bot', RECEIVER_BOT)
+        self.bot = await self.client.get_entity(self.bot_username)
         if not getattr(self.bot, "bot", False):
-            raise RuntimeError("Аккаунт OnoGo_bot не является ботом.")
+            raise RuntimeError("Указанный получатель ссылки не является Telegram-ботом.")
         self.ledger = await aiosqlite.connect(RECEIVER_DIR / "opened.sqlite3")
         await self.ledger.execute(
             "CREATE TABLE IF NOT EXISTS opened_checks ("
@@ -62,10 +70,12 @@ class CheckReceiver:
         await self.ledger.commit()
 
     async def open_check(self, url: str) -> str:
-        payload = parse_check_link(url)
+        payload = parse_check_link(url, self.bot_username)
+        journal_key = f'{self.bot_username.lower()}:{payload}'
         async with self.lock:
             async with self.ledger.execute(
-                "SELECT state FROM opened_checks WHERE payload = ?", (payload,)
+                "SELECT state FROM opened_checks WHERE payload IN (?, ?)",
+                (journal_key, payload if self.bot_username.lower() == RECEIVER_BOT.lower() else journal_key),
             ) as cursor:
                 previous = await cursor.fetchone()
             if previous:
@@ -75,7 +85,7 @@ class CheckReceiver:
 
             # Commit before the Telegram call: a crash must not cause blind retries.
             await self.ledger.execute(
-                "INSERT INTO opened_checks VALUES (?, 'ATTEMPTING')", (payload,)
+                "INSERT INTO opened_checks VALUES (?, 'ATTEMPTING')", (journal_key,)
             )
             await self.ledger.commit()
             await self.client(StartBotRequest(
@@ -83,10 +93,10 @@ class CheckReceiver:
                 random_id=secrets.randbits(63),
             ))
             await self.ledger.execute(
-                "UPDATE opened_checks SET state = 'SENT' WHERE payload = ?", (payload,)
+                "UPDATE opened_checks SET state = 'SENT' WHERE payload = ?", (journal_key,)
             )
             await self.ledger.commit()
-            return "Ссылка открыта получателем в @OnoGo_bot. Зачисление не проверялось."
+            return f'Ссылка открыта получателем в @{self.bot_username}. Зачисление не проверялось.'
 
     async def close(self):
         try:

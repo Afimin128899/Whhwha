@@ -7,6 +7,7 @@ from dotenv import set_key
 from telethon import TelegramClient
 
 import config
+from database.db import db
 from worker.check_receiver import RECEIVER_DIR, RECEIVER_SESSION
 
 
@@ -37,6 +38,9 @@ async def main():
             raise RuntimeError("Файл .env не должен быть символической ссылкой.")
         set_key(str(env_file), "CHECK_RECEIVER_ENABLED", "1")
         env_file.chmod(0o600)
+        await db.init()
+        await db.set_setting('check_receiver_account_id', str(me.id))
+        await db.set_setting('check_receiver_enabled', '1')
         print("Получатель настроен. Перезапусти службу: sudo systemctl restart whhwha")
     finally:
         await client.disconnect()

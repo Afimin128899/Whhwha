@@ -122,8 +122,16 @@ def extract_check_url(msg) -> Optional[str]:
         return match.group(0)
     if msg.entities:
         for entity, text in msg.get_entities_text():
+            url = getattr(entity, "url", None)
+            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
+                return url
             if "http" in text and "start=" in text:
                 return text
+    for row in getattr(msg, 'buttons', None) or []:
+        for button in row:
+            url = getattr(button, 'url', None)
+            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
+                return url
     return None
 
 async def process_account_telethon(

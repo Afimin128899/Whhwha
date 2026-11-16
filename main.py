@@ -17,7 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from config import BOT_TOKEN, API_POOLS
 from database.db import db
 from worker.manager import WorkerManager
-from bot.handlers import router
+from bot.handlers import router, close_auth_clients, auth_isolation
 
 # Настройка логирования
 logging.basicConfig(
@@ -54,7 +54,7 @@ async def main():
     # 2. Инициализация Aiogram Bot & Dispatcher
     bot = DefaultBotProperties(parse_mode=ParseMode.HTML)
     bot_client = Bot(token=BOT_TOKEN, default=bot)
-    dp = Dispatcher()
+    dp = Dispatcher(events_isolation=auth_isolation)
 
     # 3. Инициализация менеджера воркеров
     worker_mgr = WorkerManager(bot=bot_client)
@@ -72,6 +72,7 @@ async def main():
     finally:
         logger.info("Остановка приложения...")
         await worker_mgr.stop()
+        await close_auth_clients()
         await bot_client.session.close()
         logger.info("Приложение корректно остановлено.")
 
