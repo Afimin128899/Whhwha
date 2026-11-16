@@ -16,6 +16,7 @@ class WorkerManager:
         self._is_active = False
         self._lifecycle_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
+        self._sent_checks = 0
 
     async def start(self):
         """Запуск пяти параллельных обработчиков."""
@@ -23,6 +24,7 @@ class WorkerManager:
             if self._task and not self._task.done():
                 return False
             await db.set_setting("is_running", "1")
+            self._sent_checks = 0
             self._is_active = True
             self._task = asyncio.create_task(self._run_workers())
             logger.info("Запущено до 5 параллельных сессий")
@@ -144,6 +146,13 @@ class WorkerManager:
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True
                             )
+                            # Count successful deliveries, not failed sessions/messages.
+                            self._sent_checks += 1
+                            if self._sent_checks % 10 == 0:
+                                await self.bot.send_message(
+                                    config.ADMIN_ID,
+                                    f"Отправлено {self._sent_checks} чеков.",
+                                )
                         except Exception as e:
                             logger.error(f"Ошибка отправки чека админу: {e}")
 
