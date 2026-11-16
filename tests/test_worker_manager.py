@@ -26,6 +26,9 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.admin_patch = patch('worker.manager.config.ADMIN_ID', 123)
         self.admin_patch.start()
         self.addCleanup(self.admin_patch.stop)
+        self.env_patch = patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '0'})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
         self.addAsyncCleanup(self.manager.stop)
 
     async def test_five_concurrent_unique_sessions_and_one_completion(self):
@@ -100,7 +103,38 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(self.manager._task, 5)
         self.assertFalse(self.manager.is_running())
         self.assertEqual((await self.db.get_sessions_stats())['PROCESSING'], 0)
-        self.bot.send_message.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+        self.assertIn('Воркер остановлен', self.bot.send_message.call_args.args[1])
+
+    async def test_receiver_opens_checks_and_closes_after_workers(self):
+        receiver = AsyncMock()
+        receiver.open_check.return_value = 'Ссылка открыта получателем.'
+
+        async def process(session_name, **kwargs):
+            return 'DONE', 'ok', 'https://t.me/OnoGo_bot?start=' + session_name
+
+        with patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '1'}):
+            with patch('worker.manager.CheckReceiver', return_value=receiver):
+                with patch('worker.manager.process_account_telethon', process):
+                    await self.manager.start()
+                    await asyncio.wait_for(self.manager._task, 10)
+        receiver.connect.assert_awaited_once()
+        self.assertEqual(receiver.open_check.await_count, 12)
+        receiver.close.assert_awaited_once()
+        self.assertIsNone(self.manager._receiver)
+
+    async def test_invalid_receiver_leaves_queue_untouched(self):
+        receiver = AsyncMock()
+        receiver.connect.side_effect = RuntimeError('not authorized')
+        with patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '1'}):
+            with patch('worker.manager.CheckReceiver', return_value=receiver):
+                with self.assertLogs('worker_manager', level='ERROR'):
+                    await self.manager.start()
+                    await asyncio.wait_for(self.manager._task, 5)
+        receiver.close.assert_awaited_once()
+        receiver.open_check.assert_not_awaited()
+        self.assertEqual((await self.db.get_sessions_stats())['READY'], 12)
+        self.assertFalse(self.manager.is_running())
 
     async def test_progress_every_ten_successfully_sent_checks(self):
         for i in range(12, 25):

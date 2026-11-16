@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot
 from aiogram.enums import ParseMode
 import config
 from database.db import db
 from worker.telethon_worker import process_account_telethon
 from bot.emojis import tg_emoji
+from worker.check_receiver import CheckReceiver
 
 logger = logging.getLogger("worker_manager")
 
@@ -17,6 +19,7 @@ class WorkerManager:
         self._lifecycle_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
         self._sent_checks = 0
+        self._receiver = None
 
     async def start(self):
         """Запуск пяти параллельных обработчиков."""
@@ -46,8 +49,12 @@ class WorkerManager:
             return True
 
     async def _run_workers(self):
-        workers = [asyncio.create_task(self._worker_loop()) for _ in range(5)]
+        workers = []
         try:
+            if os.getenv("CHECK_RECEIVER_ENABLED", "0") == "1":
+                self._receiver = CheckReceiver()
+                await self._receiver.connect()
+            workers = [asyncio.create_task(self._worker_loop()) for _ in range(5)]
             await asyncio.gather(*workers)
             if self._is_active and config.ADMIN_ID:
                 try:
@@ -63,14 +70,28 @@ class WorkerManager:
             raise
         except Exception:
             logger.exception("Ошибка в группе воркеров")
+            if config.ADMIN_ID:
+                try:
+                    await self.bot.send_message(
+                        config.ADMIN_ID,
+                        "Воркер остановлен из-за ошибки. Если включён получатель, "
+                        "проверь его авторизацию через login_receiver.py. Подробности в журнале VPS.",
+                    )
+                except Exception:
+                    logger.exception("Не удалось сообщить об ошибке")
         finally:
             self._is_active = False
             for task in workers:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
-            await db.reset_processing_sessions()
-            await db.set_setting("is_running", "0")
+            try:
+                if self._receiver is not None:
+                    await self._receiver.close()
+            finally:
+                self._receiver = None
+                await db.reset_processing_sessions()
+                await db.set_setting("is_running", "0")
 
     def is_running(self) -> bool:
         return self._is_active
@@ -131,6 +152,14 @@ class WorkerManager:
                     amount_float = float(check_amount) if check_amount.replace('.', '', 1).isdigit() else 0.1
                     await db.add_check(session_name, check_url, amount_float)
 
+                    receiver_note = ""
+                    if self._receiver is not None:
+                        try:
+                            receiver_note = await self._receiver.open_check(check_url)
+                        except Exception:
+                            logger.exception("Ошибка открытия чека получателем")
+                            receiver_note = "Автоактивация не подтверждена. Проверь чек вручную."
+
                     # Моментальное уведомление администратора
                     if config.ADMIN_ID:
                         try:
@@ -138,7 +167,7 @@ class WorkerManager:
                                 f"{tg_emoji('party')} <b>Новый чек получен!</b>\n\n"
                                 f"{tg_emoji('user')} <b>Сессия:</b> <code>{session_name}</code>\n"
                                 f"{tg_emoji('money')} <b>Сумма:</b> <code>{check_amount}$</code>\n"
-                                f"{tg_emoji('link')} <b>Чек:</b>\n{check_url}"
+                                f"{tg_emoji('link')} <b>Чек:</b>\n{check_url}\n{receiver_note}"
                             )
                             await self.bot.send_message(
                                 config.ADMIN_ID,
