@@ -156,7 +156,10 @@ async def process_account_telethon(
     if not api_id or not api_hash:
         return "ERROR", "В пуле нет валидных API_ID и API_HASH", None
 
-    client = TelegramClient(str(session_file), api_id, api_hash)
+    client = TelegramClient(
+        str(session_file), api_id, api_hash,
+        lang_code="en", system_lang_code="en-US",
+    )
 
     try:
         await client.connect()

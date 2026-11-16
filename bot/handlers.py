@@ -533,7 +533,10 @@ async def process_auth_phone(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    client = TelegramClient(str(session_file), api_id, api_hash)
+    client = TelegramClient(
+        str(session_file), api_id, api_hash,
+        lang_code="en", system_lang_code="en-US",
+    )
     try:
         await client.connect()
         sent_code = await client.send_code_request(phone_formatted)
