@@ -14,6 +14,7 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.db = Database(Path(self.tmp.name) / 'test.sqlite3')
         await self.db.init()
+        await self.db.set_setting('worker_count', '5')
         await self.db.set_setting('delay_min', '0')
         await self.db.set_setting('delay_max', '0')
         for i in range(12):
@@ -65,6 +66,29 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.get_sessions_stats())['DONE'], 12)
         self.bot.send_message.assert_awaited_once()
         self.assertFalse(self.manager.is_running())
+
+    async def test_ten_concurrent_unique_sessions(self):
+        await self.db.set_setting('worker_count', '10')
+        seen = []
+        full = asyncio.Event()
+        release = asyncio.Event()
+
+        async def process(session_name, **kwargs):
+            seen.append(session_name)
+            if len(seen) == 10:
+                full.set()
+            await release.wait()
+            return 'DONE', 'ok', None
+
+        with patch('worker.manager.process_account_telethon', process):
+            await self.manager.start()
+            await asyncio.wait_for(full.wait(), 5)
+            self.assertEqual(len(seen), 10)
+            self.assertEqual(len(set(seen)), 10)
+            release.set()
+            await asyncio.wait_for(self.manager._task, 5)
+        self.assertEqual(len(seen), 12)
+        self.assertEqual(len(set(seen)), 12)
 
     async def test_stop_waits_for_cleanup_and_resets_claimed_sessions(self):
         started = 0

@@ -1,12 +1,14 @@
 """Open check deep links using the separately authorized recipient account."""
 import asyncio
 from pathlib import Path
+import time
 import re
 import secrets
 from urllib.parse import parse_qs, urlsplit
 
 import aiosqlite
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import StartBotRequest
 
 import config
@@ -44,6 +46,9 @@ class CheckReceiver:
         self.lock = asyncio.Lock()
         self.bot = None
         self.bot_username = RECEIVER_BOT
+        self._next_attempt = 0.0
+        self._clock = time.monotonic
+        self._sleep = asyncio.sleep
 
     async def connect(self):
         if not RECEIVER_SESSION.is_file():
@@ -78,20 +83,42 @@ class CheckReceiver:
                 (journal_key, payload if self.bot_username.lower() == RECEIVER_BOT.lower() else journal_key),
             ) as cursor:
                 previous = await cursor.fetchone()
-            if previous:
+            if previous and previous[0] != "WAITING":
                 if previous[0] == "SENT":
                     return "Ссылка уже отправлялась получателем."
                 return "Результат предыдущей попытки неизвестен. Проверь чек вручную."
 
             # Commit before the Telegram call: a crash must not cause blind retries.
             await self.ledger.execute(
-                "INSERT INTO opened_checks VALUES (?, 'ATTEMPTING')", (journal_key,)
+                "INSERT OR REPLACE INTO opened_checks VALUES (?, 'WAITING')", (journal_key,)
             )
             await self.ledger.commit()
-            await self.client(StartBotRequest(
+            request = StartBotRequest(
                 bot=self.bot, peer=self.bot, start_param=payload,
                 random_id=secrets.randbits(63),
-            ))
+            )
+            while True:
+                remaining = self._next_attempt - self._clock()
+                if remaining > 0:
+                    await self._sleep(remaining)
+                await self.ledger.execute(
+                    "UPDATE opened_checks SET state = 'ATTEMPTING' WHERE payload = ?",
+                    (journal_key,),
+                )
+                await self.ledger.commit()
+                # Reserve the interval even if the request fails or is cancelled.
+                self._next_attempt = self._clock() + 10.0
+                try:
+                    await self.client(request)
+                    break
+                except FloodWaitError as exc:
+                    # Telegram rejected the request: retry only after its wait expires.
+                    self._next_attempt = max(self._next_attempt, self._clock() + exc.seconds + 1)
+                    await self.ledger.execute(
+                        "UPDATE opened_checks SET state = 'WAITING' WHERE payload = ?",
+                        (journal_key,),
+                    )
+                    await self.ledger.commit()
             await self.ledger.execute(
                 "UPDATE opened_checks SET state = 'SENT' WHERE payload = ?", (journal_key,)
             )

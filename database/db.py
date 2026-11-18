@@ -10,6 +10,7 @@ DEFAULT_SETTINGS = {
     "check_count": "1",
     "delay_min": "2",
     "delay_max": "5",
+    "worker_count": "10",
     "is_running": "0"
 }
 
