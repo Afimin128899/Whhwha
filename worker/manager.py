@@ -60,9 +60,9 @@ class WorkerManager:
             if receiver_enabled == '1':
                 self._receiver = ReceiverPool()
                 await self._receiver.connect()
-            configured_count = await db.get_setting("worker_count", "10")
-            sequential = await db.get_setting("sequential_accounts", "1")
-            worker_count = 1 if sequential == "1" else (5 if configured_count == "5" else 10)
+            configured_count = await db.get_setting("worker_count", "5")
+            sequential = await db.get_setting("sequential_accounts", "0")
+            worker_count = 1 if sequential == "1" else (10 if configured_count == "10" else 5)
             workers = [asyncio.create_task(self._worker_loop()) for _ in range(worker_count)]
             await asyncio.gather(*workers)
             if self._is_active and config.ADMIN_ID:

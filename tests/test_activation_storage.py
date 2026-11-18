@@ -21,4 +21,21 @@ class ActivationStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(checks[0]['activation_note'], 'Активация не проверялась.')
             await db.set_check_activation('one', checks[0]['check_url'], '✅ Чек активирован.')
             self.assertEqual((await Database(path).get_all_checks())[0]['activation_note'], '✅ Чек активирован.')
+            self.assertEqual(await db.get_setting('sequential_accounts'), '0')
+
+    async def test_existing_sequential_mode_migrates_once_to_five_parallel_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'old.sqlite3'
+            with sqlite3.connect(path) as connection:
+                connection.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                connection.executemany('INSERT INTO settings VALUES (?, ?)', [
+                    ('worker_count', '10'), ('sequential_accounts', '1')])
+            db = Database(path)
+            await db.init()
+            self.assertEqual(await db.get_setting('worker_count'), '5')
+            self.assertEqual(await db.get_setting('sequential_accounts'), '0')
+            await db.set_setting('worker_count', '10')
+            await db.set_setting('sequential_accounts', '1')
+            await db.init()
+            self.assertEqual(await db.get_setting('worker_count'), '10')
             self.assertEqual(await db.get_setting('sequential_accounts'), '1')
