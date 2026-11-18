@@ -8,7 +8,7 @@ import config
 from database.db import db
 from worker.telethon_worker import process_account_telethon
 from bot.emojis import tg_emoji
-from worker.check_receiver import CheckReceiver, receiver_setup_lock
+from worker.check_receiver import ReceiverPool, receiver_setup_lock
 
 logger = logging.getLogger("worker_manager")
 
@@ -58,7 +58,7 @@ class WorkerManager:
             if receiver_enabled == '':
                 receiver_enabled = os.getenv('CHECK_RECEIVER_ENABLED', '0')
             if receiver_enabled == '1':
-                self._receiver = CheckReceiver()
+                self._receiver = ReceiverPool()
                 await self._receiver.connect()
             configured_count = await db.get_setting("worker_count", "10")
             sequential = await db.get_setting("sequential_accounts", "1")

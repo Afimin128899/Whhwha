@@ -19,6 +19,19 @@ from database.db import db
 RECEIVER_DIR = config.BASE_DIR / "receiver"
 RECEIVER_SESSION = RECEIVER_DIR / "recipient.session"
 RECEIVER_BOT = "OnoGo_bot"
+MAX_RECEIVERS = 5
+
+
+def receiver_session_path(slot: int, directory=None):
+    if slot not in range(1, MAX_RECEIVERS + 1):
+        raise ValueError('Номер получателя должен быть от 1 до 5.')
+    directory = RECEIVER_DIR if directory is None else directory
+    return directory / ('recipient.session' if slot == 1 else f'recipient_{slot}.session')
+
+
+def receiver_account_key(slot: int):
+    return 'check_receiver_account_id' if slot == 1 else f'check_receiver_account_id_{slot}'
+
 # Held during interactive login so the worker cannot open the same session file.
 receiver_setup_lock = asyncio.Lock()
 
@@ -69,7 +82,9 @@ def classify_activation(text: str) -> str:
 
 
 class CheckReceiver:
-    def __init__(self):
+    def __init__(self, session_path=None):
+        self.session_path = RECEIVER_SESSION if session_path is None else session_path
+        self._persist_wait = None
         self.client = None
         self.ledger = None
         self.lock = asyncio.Lock()
@@ -80,13 +95,13 @@ class CheckReceiver:
         self._sleep = asyncio.sleep
 
     async def connect(self):
-        if not RECEIVER_SESSION.is_file():
+        if not self.session_path.is_file():
             raise RuntimeError("Войди через меню «Аккаунт-получатель» в боте.")
         api_id, api_hash = config.get_random_api_credentials()
         if not api_id or not api_hash:
             raise RuntimeError("Не заданы API_ID/API_HASH.")
         self.client = TelegramClient(
-            str(RECEIVER_SESSION), api_id, api_hash,
+            str(self.session_path), api_id, api_hash,
             lang_code="en", system_lang_code="en-US", flood_sleep_threshold=0,
         )
         await self.client.connect()
@@ -139,6 +154,8 @@ class CheckReceiver:
                 await self.ledger.commit()
                 # Reserve the interval even if the request fails or is cancelled.
                 self._next_attempt = self._clock() + 10.0
+                if self._persist_wait is not None:
+                    await self._persist_wait(self._next_attempt)
                 try:
                     latest = await self.client.get_messages(self.bot, limit=1)
                     baseline = latest[0].id if latest else 0
@@ -147,6 +164,8 @@ class CheckReceiver:
                 except FloodWaitError as exc:
                     # Telegram rejected the request: retry only after its wait expires.
                     self._next_attempt = max(self._next_attempt, self._clock() + exc.seconds + 1)
+                    if self._persist_wait is not None:
+                        await self._persist_wait(self._next_attempt)
                     await self.ledger.execute(
                         "UPDATE opened_checks SET state = 'WAITING' WHERE payload = ?",
                         (journal_key,),
@@ -191,6 +210,10 @@ class CheckReceiver:
                     await asyncio.sleep(1)
         except TimeoutError:
             pass
+        except FloodWaitError as exc:
+            self._next_attempt = max(self._next_attempt, self._clock() + exc.seconds + 1)
+            if self._persist_wait is not None:
+                await self._persist_wait(self._next_attempt)
         except Exception:
             # A read failure after sending must never trigger another activation.
             pass
@@ -206,3 +229,102 @@ class CheckReceiver:
         finally:
             if self.ledger is not None:
                 await self.ledger.close()
+
+
+class ReceiverPool:
+    """Persistent round robin: one check, one recipient, one global rate limit."""
+    def __init__(self):
+        self.receivers = {}
+        self.account_ids = {}
+        self._clock = time.monotonic
+        self._wall_clock = time.time
+        self.lock = asyncio.Lock()
+        self.ledger = None
+
+    async def connect(self):
+        try:
+            for slot in range(1, MAX_RECEIVERS + 1):
+                path = receiver_session_path(slot)
+                if not path.is_file():
+                    continue
+                receiver = CheckReceiver(path)
+                self.receivers[slot] = receiver
+                await receiver.connect()
+                me = await receiver.client.get_me()
+                if not me or me.bot or me.id in self.account_ids.values():
+                    raise RuntimeError('Получатели должны быть разными пользовательскими аккаунтами.')
+                self.account_ids[slot] = me.id
+            if not self.receivers:
+                raise RuntimeError('Добавь хотя бы одного получателя в меню бота.')
+            self.ledger = next(iter(self.receivers.values())).ledger
+            await self.ledger.execute(
+                'CREATE TABLE IF NOT EXISTS receiver_assignments ('
+                'payload TEXT PRIMARY KEY, slot INTEGER NOT NULL, account_id INTEGER NOT NULL)')
+            await self.ledger.execute(
+                'CREATE TABLE IF NOT EXISTS receiver_pool_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            await self.ledger.commit()
+            for receiver in self.receivers.values():
+                receiver._persist_wait = self._persist_wait
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _setting(self, key, default):
+        async with self.ledger.execute(
+            'SELECT value FROM receiver_pool_state WHERE key = ?', (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else default
+
+    async def _persist_wait(self, deadline):
+        delay = max(0.0, deadline - self._clock())
+        await self.ledger.execute(
+            'INSERT OR REPLACE INTO receiver_pool_state VALUES (?, ?)',
+            ('next_attempt', str(self._wall_clock() + delay)),
+        )
+        await self.ledger.commit()
+
+    async def open_check(self, url):
+        async with self.lock:
+            first = next(iter(self.receivers.values()))
+            payload = parse_check_link(url, first.bot_username)
+            key = f'{first.bot_username.lower()}:{payload}'
+            async with self.ledger.execute(
+                'SELECT slot, account_id FROM receiver_assignments WHERE payload = ?', (key,)
+            ) as cursor:
+                assignment = await cursor.fetchone()
+            if assignment:
+                slot, account_id = assignment
+                if self.account_ids.get(slot) != account_id:
+                    return 'Получатель этого чека заменён или отключён. Проверь чек вручную.'
+            else:
+                slots = sorted(self.receivers)
+                last_slot = int(await self._setting('last_slot', '0'))
+                slot = next((s for s in slots if s > last_slot), slots[0])
+                # Persist before sending; cancellation or restart keeps the same account.
+                await self.ledger.execute(
+                    'INSERT INTO receiver_assignments VALUES (?, ?, ?)',
+                    (key, slot, self.account_ids[slot]),
+                )
+                await self.ledger.execute(
+                    'INSERT OR REPLACE INTO receiver_pool_state VALUES (?, ?)',
+                    ('last_slot', str(slot)),
+                )
+                await self.ledger.commit()
+            receiver = self.receivers[slot]
+            remaining = max(0.0, float(await self._setting('next_attempt', '0')) - self._wall_clock())
+            receiver._next_attempt = max(receiver._next_attempt, self._clock() + remaining)
+            note = await receiver.open_check(url)
+            return f'{note}\nПолучатель №{slot}, Telegram ID {self.account_ids[slot]}.'
+
+    async def close(self):
+        receivers, self.receivers = self.receivers, {}
+        self.account_ids = {}
+        try:
+            for receiver in receivers.values():
+                try:
+                    await receiver.close()
+                except Exception:
+                    pass
+        finally:
+            self.ledger = None

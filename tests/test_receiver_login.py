@@ -73,6 +73,33 @@ class ReceiverLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.message.delete.await_count, 2)
         self.assertIsNone(await self.state.get_state())
 
+    async def test_fifth_recipient_does_not_replace_first(self):
+        self.callback.data = 'receiver_login:5'
+        await self.begin()
+        self.message.text = '12345'
+        await h.process_auth_code(self.message, self.state, self.manager)
+        self.assertEqual(self.recipient.read_bytes(), b'old-recipient')
+        self.assertEqual((self.root / 'recipient_5.session').read_bytes(), b'new-recipient')
+        self.db.set_setting.assert_any_await('check_receiver_account_id_5', '999')
+        self.db.add_session.assert_not_awaited()
+
+    async def test_duplicate_account_keeps_original_slots(self):
+        self.callback.data = 'receiver_login:2'
+        self.db.get_setting.return_value = '999'
+        await self.begin()
+        self.message.text = '12345'
+        await h.process_auth_code(self.message, self.state, self.manager)
+        self.assertEqual(self.recipient.read_bytes(), b'old-recipient')
+        self.assertFalse((self.root / 'recipient_2.session').exists())
+        self.db.set_setting.assert_not_awaited()
+        self.assertFalse(h.receiver_setup_lock.locked())
+
+    async def test_invalid_slot_is_rejected(self):
+        self.callback.data = 'receiver_login:6'
+        await h.cb_receiver_login(self.callback, self.state, self.manager)
+        self.manager.stop.assert_not_awaited()
+        self.assertFalse(h.receiver_setup_lock.locked())
+
     async def test_two_factor_password_is_not_trimmed_or_persisted(self):
         await self.begin()
         self.client.sign_in.side_effect = [SessionPasswordNeededError(None), None]

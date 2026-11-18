@@ -37,7 +37,8 @@ from bot.keyboards import (
 from bot.states import SettingsStates, AddSessionStates, ReceiverStates
 from bot.emojis import tg_emoji, emoji_id
 from worker.check_receiver import (
-    CheckReceiver, RECEIVER_DIR, RECEIVER_SESSION, RECEIVER_BOT, receiver_setup_lock,
+    ReceiverPool, RECEIVER_DIR, RECEIVER_SESSION, RECEIVER_BOT, receiver_setup_lock,
+    MAX_RECEIVERS, receiver_session_path, receiver_account_key,
 )
 
 router = Router()
@@ -99,7 +100,10 @@ def receiver_admin(user, chat) -> bool:
 
 def receiver_keyboard():
     return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text='Войти по номеру', callback_data='receiver_login')],
+        *[[types.InlineKeyboardButton(text=f'Получатель №{slot}: войти / заменить',
+                                      callback_data=f'receiver_login:{slot}')]
+          for slot in range(1, MAX_RECEIVERS + 1)],
+        [types.InlineKeyboardButton(text='Включить автооткрытие', callback_data='receiver_enable')],
         [types.InlineKeyboardButton(text='Проверить подключение', callback_data='receiver_test')],
         [types.InlineKeyboardButton(text='Бот из ссылки чека', callback_data='receiver_set_bot')],
         [types.InlineKeyboardButton(text='Отключить автооткрытие', callback_data='receiver_disable')],
@@ -116,16 +120,20 @@ async def cb_receiver_menu(callback: types.CallbackQuery, state: FSMContext):
     enabled = await db.get_setting('check_receiver_enabled', '')
     if enabled == '':
         enabled = os.getenv('CHECK_RECEIVER_ENABLED', '0')
-    account_id = await db.get_setting('check_receiver_account_id', '')
     check_bot = await db.get_setting('check_receiver_bot', RECEIVER_BOT)
     status = 'включено' if enabled == '1' else 'выключено'
-    saved = 'сохранена' if RECEIVER_SESSION.is_file() else 'не настроена'
+    saved = []
+    for slot in range(1, MAX_RECEIVERS + 1):
+        configured = receiver_session_path(slot, RECEIVER_DIR).is_file()
+        saved_id = await db.get_setting(receiver_account_key(slot), '')
+        saved.append(f'№{slot}: ' + (f'подключён, ID {escape(saved_id) or "неизвестен"}' if configured else 'не настроен'))
     await callback.message.answer(
-        f'Аккаунт-получатель\nАвтооткрытие: {status}. Сессия: {saved}.\n'
-        f'Telegram ID: {escape(account_id) if account_id else "пока неизвестен"}.\n\n'
+        f'Аккаунты-получатели (до 5)\nАвтооткрытие: {status}.\n'
+        + '\n'.join(saved) + '\n\n'
         f'Бот из ссылки чека: @{escape(check_bot)}.\n'
         'Вход и проверка остановят воркер. После настройки запусти его снова.\n'
-        'Этот аккаунт не добавляется в рабочую очередь.', reply_markup=receiver_keyboard(),
+        'Каждый чек отправляется одному получателю по очереди: 1 → 2 → … → 1.\n'
+        'Получатели не добавляются в рабочую очередь.', reply_markup=receiver_keyboard(),
     )
     await callback.answer()
 
@@ -162,13 +170,19 @@ async def process_receiver_bot(message: types.Message, state: FSMContext, worker
     )
 
 
-@router.callback_query(F.data == 'receiver_login')
+@router.callback_query((F.data == 'receiver_login') | F.data.startswith('receiver_login:'))
 async def cb_receiver_login(callback: types.CallbackQuery, state: FSMContext, worker_mgr: WorkerManager):
     if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
         return await callback.answer('Нет доступа.', show_alert=True)
     await cancel_auth(callback.from_user.id)
     if receiver_setup_lock.locked():
         return await callback.answer('Вход уже выполняется.', show_alert=True)
+    data = getattr(callback, 'data', 'receiver_login')
+    try:
+        slot = int(data.split(':', 1)[1]) if ':' in data else 1
+        receiver_session_path(slot, RECEIVER_DIR)
+    except (ValueError, TypeError):
+        return await callback.answer('Номер получателя должен быть от 1 до 5.', show_alert=True)
     await receiver_setup_lock.acquire()
     receiver_auth_users.add(callback.from_user.id)
     try:
@@ -178,11 +192,11 @@ async def cb_receiver_login(callback: types.CallbackQuery, state: FSMContext, wo
         for suffix in ('', '-journal', '-wal', '-shm'):
             (RECEIVER_DIR / f'pending_{callback.from_user.id}.session{suffix}').unlink(missing_ok=True)
         await state.clear()
-        await state.update_data(auth_target='receiver')
+        await state.update_data(auth_target='receiver', receiver_slot=slot)
         await state.set_state(AddSessionStates.waiting_for_phone)
         schedule_auth_timeout(callback.from_user.id, state)
         await callback.message.answer(
-            'Вход в твой аккаунт-получатель. Отправь номер с кодом страны.\n'
+            f'Вход в аккаунт-получатель №{slot}. Отправь номер с кодом страны.\n'
             'На вход есть 5 минут. Предыдущий получатель сохранится до успешного входа.\n'
             'Сообщения с номером, кодом и паролем бот попробует удалить после обработки.',
             reply_markup=get_back_cancel_keyboard(to_where='receiver_menu'),
@@ -192,6 +206,19 @@ async def cb_receiver_login(callback: types.CallbackQuery, state: FSMContext, wo
         await cancel_auth(callback.from_user.id)
         await state.clear()
         raise
+
+
+@router.callback_query(F.data == 'receiver_enable')
+async def cb_receiver_enable(callback: types.CallbackQuery, state: FSMContext, worker_mgr: WorkerManager):
+    if not receiver_admin(callback.from_user, getattr(callback.message, 'chat', None)):
+        return await callback.answer('Нет доступа.', show_alert=True)
+    await cancel_auth(callback.from_user.id)
+    await worker_mgr.stop()
+    if not any(receiver_session_path(slot, RECEIVER_DIR).is_file()
+               for slot in range(1, MAX_RECEIVERS + 1)):
+        return await callback.answer('Сначала добавь хотя бы одного получателя.', show_alert=True)
+    await db.set_setting('check_receiver_enabled', '1')
+    await cb_receiver_menu(callback, state)
 
 
 @router.callback_query(F.data == 'receiver_disable')
@@ -211,14 +238,14 @@ async def cb_receiver_test(callback: types.CallbackQuery, state: FSMContext, wor
     await cancel_auth(callback.from_user.id)
     await state.clear()
     await callback.answer('Проверяю подключение…')
-    receiver = CheckReceiver()
+    receiver = ReceiverPool()
     await receiver_setup_lock.acquire()
     try:
         await worker_mgr.stop()
         await receiver.connect()
-        me = await receiver.client.get_me()
+        accounts = ', '.join(f'№{slot}: ID {account_id}' for slot, account_id in receiver.account_ids.items())
         await callback.message.answer(
-            f'Получатель подключён: Telegram ID {me.id}. Бот чеков доступен.\n'
+            f'Получатели подключены: {accounts}. Бот чеков доступен.\n'
             'Проверка не открывала чеки. Теперь можно запустить воркер.',
             reply_markup=receiver_keyboard(),
         )
@@ -974,10 +1001,19 @@ async def finish_receiver_auth(message: types.Message, state: FSMContext):
         await client.disconnect()
         active_auth_clients.pop(user_id, None)
         source = RECEIVER_DIR / f'pending_{user_id}.session'
-        os.replace(source, RECEIVER_SESSION)
-        RECEIVER_SESSION.chmod(0o600)
-        await db.set_setting('check_receiver_account_id', str(me.id))
+        data = await state.get_data()
+        slot = data.get('receiver_slot', 1)
+        for other in range(1, MAX_RECEIVERS + 1):
+            if other != slot and await db.get_setting(receiver_account_key(other), '') == str(me.id):
+                raise ValueError('Этот аккаунт уже добавлен в другой слот')
+        destination = receiver_session_path(slot, RECEIVER_DIR)
+        os.replace(source, destination)
+        destination.chmod(0o600)
+        await db.set_setting(receiver_account_key(slot), str(me.id))
         await db.set_setting('check_receiver_enabled', '1')
+    except ValueError as exc:
+        await message.answer(f'Получатель не сохранён: {escape(str(exc))}.')
+        return
     except Exception as exc:
         await message.answer(f'Не удалось сохранить получателя: {type(exc).__name__}. Повтори вход.')
         return
@@ -985,7 +1021,7 @@ async def finish_receiver_auth(message: types.Message, state: FSMContext):
         await cancel_auth(user_id)
         await state.clear()
     await message.answer(
-        f'Получатель подключён: Telegram ID {me.id}. Автооткрытие включено.\n'
+        f'Получатель №{slot} подключён: Telegram ID {me.id}. Автооткрытие включено.\n'
         'Аккаунт сохранён отдельно от рабочей очереди. Запусти воркер в главном меню.',
         reply_markup=receiver_keyboard(),
     )
