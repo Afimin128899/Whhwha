@@ -438,7 +438,8 @@ async def cb_get_check(callback: types.CallbackQuery):
     if check is None:
         return await callback.answer("Чек больше не доступен.", show_alert=True)
 
-    link = escape(check["check_url"])
+    check_url = check["check_url"]
+    link = escape(check_url)
     if action == "confirm_check":
         await message.edit_text(
             f"Чек активирован (по вашему подтверждению).\n{link}",
@@ -446,12 +447,16 @@ async def cb_get_check(callback: types.CallbackQuery):
             disable_web_page_preview=True,
         )
     else:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(
-                text="Подтвердить активацию",
-                callback_data=f"confirm_check:{check_id}",
-            )],
-        ])
+        buttons = [[types.InlineKeyboardButton(
+            text="Подтвердить активацию",
+            callback_data=f"confirm_check:{check_id}",
+        )]]
+        if re.fullmatch(r"https://t\.me/redcubebetbot\?start=[A-Za-z0-9_-]{1,64}", check_url, re.IGNORECASE | re.ASCII):
+            buttons.insert(0, [types.InlineKeyboardButton(
+                text="Открыть в @redcubebetbot",
+                url=check_url,
+            )])
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(
             f"Ссылка на чек:\n{link}",
             reply_markup=keyboard,
