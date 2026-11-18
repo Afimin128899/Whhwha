@@ -498,10 +498,22 @@ async def cb_menu_settings(callback: types.CallbackQuery, state: FSMContext):
         f"{tg_emoji('speaker')} <b>Каналы для подписки:</b> <code>{settings.get('channels', '')}</code>\n"
         f"{tg_emoji('dollar')} <b>Сумма чека:</b> <code>{settings.get('check_amount', '0.1')}$</code>\n"
         f"{tg_emoji('stopwatch')} <b>Интервал пауз:</b> <code>{settings.get('delay_min', '2')} - {settings.get('delay_max', '5')} сек</code>\n\n"
+        "Рабочих аккаунтов одновременно: "
+        f"<b>{settings.get('worker_count', '10')}</b> (со следующего запуска).\n"
+        "Активация чеков: не чаще одного раза в 10 секунд.\n\n"
         "<i>Нажмите на кнопку ниже, чтобы изменить соответствующий параметр.</i>"
     )
     await callback.message.edit_text(text, reply_markup=get_settings_keyboard(settings), parse_mode=ParseMode.HTML)
     await callback.answer()
+
+@router.callback_query(F.data == "toggle_worker_count")
+async def cb_toggle_worker_count(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_admin(callback.from_user):
+        return await callback.answer("Нет доступа", show_alert=True)
+    current = await db.get_setting("worker_count", "10")
+    await db.set_setting("worker_count", "10" if current == "5" else "5")
+    await cb_menu_settings(callback, state)
+
 
 @router.callback_query(F.data == "set_ref_link")
 async def cb_set_ref_link(callback: types.CallbackQuery, state: FSMContext):

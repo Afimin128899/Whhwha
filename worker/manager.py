@@ -23,7 +23,7 @@ class WorkerManager:
         self._receiver = None
 
     async def start(self):
-        """Запуск пяти параллельных обработчиков."""
+        """Запуск до десяти параллельных обработчиков."""
         async with self._lifecycle_lock:
             if receiver_setup_lock.locked():
                 return False
@@ -33,7 +33,7 @@ class WorkerManager:
             self._sent_checks = 0
             self._is_active = True
             self._task = asyncio.create_task(self._run_workers())
-            logger.info("Запущено до 5 параллельных сессий")
+            logger.info("Запущена обработка очереди сессий")
             return True
 
     async def stop(self):
@@ -60,7 +60,9 @@ class WorkerManager:
             if receiver_enabled == '1':
                 self._receiver = CheckReceiver()
                 await self._receiver.connect()
-            workers = [asyncio.create_task(self._worker_loop()) for _ in range(5)]
+            configured_count = await db.get_setting("worker_count", "10")
+            worker_count = 5 if configured_count == "5" else 10
+            workers = [asyncio.create_task(self._worker_loop()) for _ in range(worker_count)]
             await asyncio.gather(*workers)
             if self._is_active and config.ADMIN_ID:
                 try:

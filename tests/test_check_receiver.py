@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
+from telethon.errors import FloodWaitError
 
 from worker.check_receiver import CheckReceiver, parse_check_link
 
@@ -38,6 +39,15 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.receiver = CheckReceiver()
+        self.now = 0.0
+        self.sleeps = []
+        self.receiver._clock = lambda: self.now
+
+        async def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+        self.receiver._sleep = sleep
         self.receiver.client = AsyncMock()
         self.receiver.bot = object()
         self.receiver.ledger = await aiosqlite.connect(Path(tmp.name) / 'ledger.sqlite3')
@@ -69,6 +79,41 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
             f'https://t.me/OnoGo_bot?start=check{i}') for i in range(5)))
         self.assertEqual(peak, 1)
         self.assertEqual(self.receiver.client.await_count, 5)
+
+    async def test_requests_have_ten_second_spacing(self):
+        times = []
+
+        async def send(request):
+            times.append(self.now)
+
+        self.receiver.client.side_effect = send
+        await asyncio.gather(*(self.receiver.open_check(
+            f'https://t.me/OnoGo_bot?start=timed{i}') for i in range(3)))
+        self.assertEqual(times, [0.0, 10.0, 20.0])
+
+    async def test_flood_wait_is_observed_before_retry(self):
+        self.receiver.client.side_effect = [FloodWaitError(None, capture=25), None]
+        await self.receiver.open_check('https://t.me/OnoGo_bot?start=wait')
+        self.assertEqual(self.sleeps, [26.0])
+        self.assertEqual(self.receiver.client.await_count, 2)
+        self.assertEqual(self.receiver.client.await_args_list[0],
+                         self.receiver.client.await_args_list[1])
+        self.assertIn('уже отправлялась', await self.receiver.open_check(
+            'https://t.me/OnoGo_bot?start=wait'))
+
+    async def test_cancellation_during_wait_leaves_check_retryable(self):
+        await self.receiver.open_check('https://t.me/OnoGo_bot?start=first')
+
+        async def cancel(seconds):
+            raise asyncio.CancelledError()
+
+        sleep = self.receiver._sleep
+        self.receiver._sleep = cancel
+        with self.assertRaises(asyncio.CancelledError):
+            await self.receiver.open_check('https://t.me/OnoGo_bot?start=queued')
+        self.receiver._sleep = sleep
+        await self.receiver.open_check('https://t.me/OnoGo_bot?start=queued')
+        self.assertEqual(self.receiver.client.await_count, 2)
 
     async def test_uncertain_send_is_not_blindly_retried(self):
         self.receiver.client.side_effect = OSError('connection lost')

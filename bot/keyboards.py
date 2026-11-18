@@ -107,6 +107,10 @@ def get_settings_keyboard(settings: Dict[str, str]) -> InlineKeyboardMarkup:
             )
         ]
     ]
+    keyboard.insert(0, [InlineKeyboardButton(
+        text=f"Рабочих аккаунтов одновременно: {settings.get('worker_count', '10')}",
+        callback_data="toggle_worker_count",
+    )])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_back_cancel_keyboard(to_where: str = "menu_settings") -> InlineKeyboardMarkup:
