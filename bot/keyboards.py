@@ -19,7 +19,7 @@ def get_main_keyboard(is_running: bool) -> InlineKeyboardMarkup:
 
     keyboard = [
         [run_btn],
-        [InlineKeyboardButton(text="Аккаунт-получатель", callback_data="receiver_menu")],
+        [InlineKeyboardButton(text="Аккаунты-получатели (до 5)", callback_data="receiver_menu")],
         [
             InlineKeyboardButton(
                 text="Статистика",

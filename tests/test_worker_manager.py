@@ -159,7 +159,7 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             return 'DONE', 'ok', 'https://t.me/OnoGo_bot?start=' + session_name
 
         with patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '1'}):
-            with patch('worker.manager.CheckReceiver', return_value=receiver):
+            with patch('worker.manager.ReceiverPool', return_value=receiver):
                 with patch('worker.manager.process_account_telethon', process):
                     await self.manager.start()
                     await asyncio.wait_for(self.manager._task, 10)
@@ -175,7 +175,7 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         receiver = AsyncMock()
         receiver.connect.side_effect = RuntimeError('not authorized')
         with patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '1'}):
-            with patch('worker.manager.CheckReceiver', return_value=receiver):
+            with patch('worker.manager.ReceiverPool', return_value=receiver):
                 with self.assertLogs('worker_manager', level='ERROR'):
                     await self.manager.start()
                     await asyncio.wait_for(self.manager._task, 5)
