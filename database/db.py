@@ -11,6 +11,7 @@ DEFAULT_SETTINGS = {
     "delay_min": "2",
     "delay_max": "5",
     "worker_count": "10",
+    "sequential_accounts": "1",
     "is_running": "0"
 }
 
@@ -48,6 +49,11 @@ class Database:
                     created_at TEXT NOT NULL
                 )
             """)
+
+            async with db.execute("PRAGMA table_info(checks)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            if 'activation_note' not in columns:
+                await db.execute("ALTER TABLE checks ADD COLUMN activation_note TEXT NOT NULL DEFAULT 'Активация не проверялась.'")
 
             # Заполняем дефолтные настройки, если их нет
             for key, val in DEFAULT_SETTINGS.items():
@@ -168,6 +174,14 @@ class Database:
             await db.execute(
                 "INSERT INTO checks (session_name, check_url, amount, created_at) VALUES (?, ?, ?, ?)",
                 (session_name, check_url, amount, now)
+            )
+            await db.commit()
+
+    async def set_check_activation(self, session_name: str, check_url: str, note: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE checks SET activation_note = ? WHERE session_name = ? AND check_url = ?",
+                (note, session_name, check_url),
             )
             await db.commit()
 

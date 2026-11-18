@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import re
 import secrets
+from html import escape
 from urllib.parse import parse_qs, urlsplit
 
 import aiosqlite
@@ -37,6 +38,34 @@ def parse_check_link(url: str, bot_username: str = RECEIVER_BOT) -> str:
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", payloads[0])):
         raise ValueError("Некорректный start-параметр чека.")
     return payloads[0]
+
+
+ACTIVATION_LABELS = {
+    'ACTIVATED': '✅ Чек активирован: бот подтвердил получение.',
+    'ALREADY_ACTIVATED': 'ℹ️ Чек уже активирован ранее (ответ бота).',
+    'REJECTED': '❌ Чек не активирован: бот отклонил активацию.',
+    'UNKNOWN': '❓ Активация чека не подтверждена. Проверь вручную.',
+}
+
+
+def is_receipt_confirmation(text: str) -> bool:
+    return bool(re.fullmatch(
+        r'вы получили \d+(?:[.,]\d+)?\s*\$\.?', ' '.join(text.lower().split())
+    ))
+
+
+def classify_activation(text: str) -> str:
+    """Recognize explicit results; generic menus and balances prove nothing."""
+    text = ' '.join(text.lower().split())
+    if re.search(r'чек (?:уже активирован|уже был активирован)|check (?:has )?(?:already been activated|already redeemed)|you have already (?:activated|redeemed)', text):
+        return 'ALREADY_ACTIVATED'
+    if re.search(r'чек (?:не найден|недействителен|ист[её]к|удал[её]н)|не удалось активировать|check (?:is )?(?:expired|invalid|not found)|cannot (?:activate|redeem)', text):
+        return 'REJECTED'
+    if is_receipt_confirmation(text):
+        return 'ACTIVATED'
+    if re.search(r'(?:вы|ты) (?:успешно )?активировал[аи]? чек|чек успешно активирован|you (?:have )?(?:successfully )?(?:received|redeemed) \d|you (?:have )?successfully activated (?:the |a )?check', text):
+        return 'ACTIVATED'
+    return 'UNKNOWN'
 
 
 class CheckReceiver:
@@ -84,6 +113,8 @@ class CheckReceiver:
             ) as cursor:
                 previous = await cursor.fetchone()
             if previous and previous[0] != "WAITING":
+                if previous[0] in ACTIVATION_LABELS:
+                    return ACTIVATION_LABELS[previous[0]]
                 if previous[0] == "SENT":
                     return "Ссылка уже отправлялась получателем."
                 return "Результат предыдущей попытки неизвестен. Проверь чек вручную."
@@ -109,7 +140,9 @@ class CheckReceiver:
                 # Reserve the interval even if the request fails or is cancelled.
                 self._next_attempt = self._clock() + 10.0
                 try:
-                    await self.client(request)
+                    latest = await self.client.get_messages(self.bot, limit=1)
+                    baseline = latest[0].id if latest else 0
+                    updates = await self.client(request)
                     break
                 except FloodWaitError as exc:
                     # Telegram rejected the request: retry only after its wait expires.
@@ -123,7 +156,48 @@ class CheckReceiver:
                 "UPDATE opened_checks SET state = 'SENT' WHERE payload = ?", (journal_key,)
             )
             await self.ledger.commit()
-            return f'Ссылка открыта получателем в @{self.bot_username}. Зачисление не проверялось.'
+            state, note = await self._observe_activation(payload, baseline, updates)
+            await self.ledger.execute(
+                "UPDATE opened_checks SET state = ? WHERE payload = ?", (state, journal_key)
+            )
+            await self.ledger.commit()
+            return note
+
+    async def _observe_activation(self, payload, baseline, updates):
+        outgoing_ids = {
+            message.id for update in getattr(updates, 'updates', [])
+            if (message := getattr(update, 'message', None)) is not None
+            and getattr(message, 'out', False)
+        }
+        boundary = max(outgoing_ids, default=baseline)
+        last_text = ''
+        try:
+            async with asyncio.timeout(8):
+                while True:
+                    messages = await self.client.get_messages(self.bot, limit=10)
+                    for message in reversed(messages):
+                        if message.out or message.id <= boundary:
+                            continue
+                        text = message.raw_text or ''
+                        last_text = text[:500]
+                        reply_to = getattr(message, 'reply_to_msg_id', None)
+                        correlated = reply_to in outgoing_ids or bool(re.search(
+                            r'(?<![A-Za-z0-9_-])' + re.escape(payload) + r'(?![A-Za-z0-9_-])', text))
+                        state = classify_activation(text)
+                        # Exact receipt text supplied by the owner is also accepted
+                        # as the fresh reply in this serialized bot dialogue.
+                        if (correlated or is_receipt_confirmation(text)) and state != 'UNKNOWN':
+                            return state, ACTIVATION_LABELS[state] + '\nОтвет бота: ' + escape(last_text)
+                    await asyncio.sleep(1)
+        except TimeoutError:
+            pass
+        except Exception:
+            # A read failure after sending must never trigger another activation.
+            pass
+        note = ACTIVATION_LABELS['UNKNOWN']
+        if last_text:
+            note += '\nОтвет бота (связь с этим чеком не подтверждена): ' + escape(last_text)
+        return 'UNKNOWN', note
 
     async def close(self):
         try:
