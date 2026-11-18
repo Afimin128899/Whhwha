@@ -2,6 +2,7 @@
 import asyncio
 import getpass
 import os
+import warnings
 
 from dotenv import set_key
 from telethon import TelegramClient
@@ -11,10 +12,23 @@ from database.db import db
 from worker.check_receiver import RECEIVER_DIR, RECEIVER_SESSION
 
 
+def read_secret(prompt: str) -> str:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            raise SystemExit("Запусти скрипт в интерактивном терминале для скрытого ввода.") from None
+
+
 async def main():
     api_id, api_hash = config.get_random_api_credentials()
     if not api_id or not api_hash:
         raise SystemExit("Сначала заполни API_ID/API_HASH через bash install.sh.")
+    env_file = config.BASE_DIR / ".env"
+    for path in (env_file, RECEIVER_DIR, RECEIVER_SESSION):
+        if path.is_symlink():
+            raise SystemExit(f"Символическая ссылка не поддерживается: {path.name}")
     os.umask(0o077)
     RECEIVER_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     RECEIVER_DIR.chmod(0o700)
@@ -25,17 +39,16 @@ async def main():
     try:
         await client.start(
             phone=lambda: input("Номер аккаунта-получателя с кодом страны: ").strip(),
-            code_callback=lambda: getpass.getpass("Код входа из Telegram: ").strip(),
-            password=lambda: getpass.getpass("Пароль двухэтапной аутентификации: "),
+            code_callback=lambda: read_secret("Код входа из Telegram: ").strip(),
+            password=lambda: read_secret("Пароль двухэтапной аутентификации: "),
         )
         me = await client.get_me()
+        if me is None or me.bot:
+            raise SystemExit("Для получателя нужен пользовательский аккаунт Telegram.")
         print(f"Аккаунт-получатель: Telegram ID {me.id}.")
         if input("Открывать чеки этим аккаунтом? Введи YES: ").strip() != "YES":
-            print("Автоактивация не включена.")
+            print("Настройки автооткрытия не изменены.")
             return
-        env_file = config.BASE_DIR / ".env"
-        if env_file.is_symlink():
-            raise RuntimeError("Файл .env не должен быть символической ссылкой.")
         set_key(str(env_file), "CHECK_RECEIVER_ENABLED", "1")
         env_file.chmod(0o600)
         await db.init()
