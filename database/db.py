@@ -10,8 +10,8 @@ DEFAULT_SETTINGS = {
     "check_count": "1",
     "delay_min": "2",
     "delay_max": "5",
-    "worker_count": "10",
-    "sequential_accounts": "1",
+    "worker_count": "5",
+    "sequential_accounts": "0",
     "is_running": "0"
 }
 
@@ -62,6 +62,18 @@ class Database:
                     (key, val)
                 )
 
+            # Apply the requested five-worker mode once on both new and existing installs.
+            # Later menu changes survive subsequent restarts.
+            async with db.execute(
+                "SELECT value FROM settings WHERE key = 'five_workers_default_v1'"
+            ) as cursor:
+                migrated = await cursor.fetchone()
+            if migrated is None:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    [('worker_count', '5'), ('sequential_accounts', '0'),
+                     ('five_workers_default_v1', '1')],
+                )
             await db.commit()
 
     async def get_setting(self, key: str, default: Optional[str] = None) -> str:
