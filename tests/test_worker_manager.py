@@ -15,6 +15,7 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.db = Database(Path(self.tmp.name) / 'test.sqlite3')
         await self.db.init()
         await self.db.set_setting('worker_count', '5')
+        await self.db.set_setting('sequential_accounts', '0')
         await self.db.set_setting('delay_min', '0')
         await self.db.set_setting('delay_max', '0')
         for i in range(12):
@@ -66,6 +67,26 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.get_sessions_stats())['DONE'], 12)
         self.bot.send_message.assert_awaited_once()
         self.assertFalse(self.manager.is_running())
+
+    async def test_accounts_run_sequentially(self):
+        await self.db.set_setting('sequential_accounts', '1')
+        active = peak = 0
+        seen = []
+
+        async def process(session_name, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            seen.append(session_name)
+            await asyncio.sleep(0.001)
+            active -= 1
+            return 'DONE', 'ok', None
+
+        with patch('worker.manager.process_account_telethon', process):
+            await self.manager.start()
+            await asyncio.wait_for(self.manager._task, 5)
+        self.assertEqual(peak, 1)
+        self.assertEqual(len(set(seen)), 12)
 
     async def test_ten_concurrent_unique_sessions(self):
         await self.db.set_setting('worker_count', '10')
@@ -145,6 +166,9 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         receiver.connect.assert_awaited_once()
         self.assertEqual(receiver.open_check.await_count, 12)
         receiver.close.assert_awaited_once()
+        checks = await self.db.get_all_checks()
+        self.assertEqual(len(checks), 12)
+        self.assertTrue(all(c['activation_note'] == 'Ссылка открыта получателем.' for c in checks))
         self.assertIsNone(self.manager._receiver)
 
     async def test_invalid_receiver_leaves_queue_untouched(self):

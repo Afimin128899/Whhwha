@@ -61,7 +61,8 @@ class WorkerManager:
                 self._receiver = CheckReceiver()
                 await self._receiver.connect()
             configured_count = await db.get_setting("worker_count", "10")
-            worker_count = 5 if configured_count == "5" else 10
+            sequential = await db.get_setting("sequential_accounts", "1")
+            worker_count = 1 if sequential == "1" else (5 if configured_count == "5" else 10)
             workers = [asyncio.create_task(self._worker_loop()) for _ in range(worker_count)]
             await asyncio.gather(*workers)
             if self._is_active and config.ADMIN_ID:
@@ -160,7 +161,7 @@ class WorkerManager:
                     amount_float = float(check_amount) if check_amount.replace('.', '', 1).isdigit() else 0.1
                     await db.add_check(session_name, check_url, amount_float)
 
-                    receiver_note = ""
+                    receiver_note = "Активация не проверялась: получатель выключен."
                     if self._receiver is not None:
                         try:
                             receiver_note = await self._receiver.open_check(check_url)
@@ -172,6 +173,8 @@ class WorkerManager:
                                 f'Автооткрытие: {type(exc).__name__}. '
                                 'Зачисление не подтверждено. Проверь получателя в меню и чек вручную.'
                             )
+
+                    await db.set_check_activation(session_name, check_url, receiver_note)
 
                     # Моментальное уведомление администратора
                     if config.ADMIN_ID:

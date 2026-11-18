@@ -389,7 +389,7 @@ async def cb_view_checks(callback: types.CallbackQuery):
     last_checks = checks[:15]
     lines = [f"{tg_emoji('dollar')} <b>Последние полученные чеки:</b>\n"]
     for i, c in enumerate(last_checks, 1):
-        lines.append(f"{i}. <code>{c['session_name']}</code> | {c['amount']}$ -> {c['check_url']}")
+        lines.append(f"{i}. <code>{c['session_name']}</code> | {c['amount']}$ -> {c['check_url']}\n{c.get('activation_note', 'Активация не проверялась.').splitlines()[0]}")
 
     if len(checks) > 15:
         lines.append(f"\n<i>... и еще {len(checks) - 15} чеков. Нажмите кнопку выгрузки для полного списка.</i>")
@@ -499,7 +499,7 @@ async def cb_menu_settings(callback: types.CallbackQuery, state: FSMContext):
         f"{tg_emoji('dollar')} <b>Сумма чека:</b> <code>{settings.get('check_amount', '0.1')}$</code>\n"
         f"{tg_emoji('stopwatch')} <b>Интервал пауз:</b> <code>{settings.get('delay_min', '2')} - {settings.get('delay_max', '5')} сек</code>\n\n"
         "Рабочих аккаунтов одновременно: "
-        f"<b>{settings.get('worker_count', '10')}</b> (со следующего запуска).\n"
+        f"<b>{'по очереди' if settings.get('sequential_accounts', '1') == '1' else settings.get('worker_count', '10')}</b> (со следующего запуска).\n"
         "Активация чеков: не чаще одного раза в 10 секунд.\n\n"
         "<i>Нажмите на кнопку ниже, чтобы изменить соответствующий параметр.</i>"
     )
@@ -511,7 +511,14 @@ async def cb_toggle_worker_count(callback: types.CallbackQuery, state: FSMContex
     if not await check_admin(callback.from_user):
         return await callback.answer("Нет доступа", show_alert=True)
     current = await db.get_setting("worker_count", "10")
-    await db.set_setting("worker_count", "10" if current == "5" else "5")
+    sequential = await db.get_setting("sequential_accounts", "1")
+    if sequential == "1":
+        await db.set_setting("worker_count", "5")
+        await db.set_setting("sequential_accounts", "0")
+    elif current == "5":
+        await db.set_setting("worker_count", "10")
+    else:
+        await db.set_setting("sequential_accounts", "1")
     await cb_menu_settings(callback, state)
 
 

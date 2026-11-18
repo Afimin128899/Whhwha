@@ -2,12 +2,13 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 import aiosqlite
 from telethon.errors import FloodWaitError
 
-from worker.check_receiver import CheckReceiver, parse_check_link
+from worker.check_receiver import CheckReceiver, parse_check_link, classify_activation
 
 
 class CheckLinkTests(unittest.TestCase):
@@ -48,13 +49,27 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
             self.now += seconds
 
         self.receiver._sleep = sleep
+        self.observe = AsyncMock(return_value=('SENT', 'Запрос отправлен.'))
+        self.receiver._observe_activation = self.observe
         self.receiver.client = AsyncMock()
+        self.receiver.client.get_messages.return_value = []
         self.receiver.bot = object()
         self.receiver.ledger = await aiosqlite.connect(Path(tmp.name) / 'ledger.sqlite3')
         await self.receiver.ledger.execute(
             'CREATE TABLE opened_checks (payload TEXT PRIMARY KEY, state TEXT NOT NULL)')
         await self.receiver.ledger.commit()
         self.addAsyncCleanup(self.receiver.close)
+
+    async def test_confirmed_result_is_persisted_without_resending(self):
+        self.observe.return_value = ('ACTIVATED', '✅ Чек активирован.')
+        url = 'https://t.me/OnoGo_bot?start=confirmed'
+        self.assertIn('активирован', await self.receiver.open_check(url))
+        self.assertIn('активирован', await self.receiver.open_check(url))
+        self.receiver.client.assert_awaited_once()
+        async with self.receiver.ledger.execute(
+            "SELECT state FROM opened_checks WHERE payload = 'onogo_bot:confirmed'"
+        ) as cursor:
+            self.assertEqual((await cursor.fetchone())[0], 'ACTIVATED')
 
     async def test_duplicate_links_only_open_once(self):
         url = 'https://t.me/OnoGo_bot?start=abc'
@@ -135,3 +150,59 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('уже отправлялась', await self.receiver.open_check(
             'https://t.me/OnoGo_bot?start=abc'))
         self.receiver.client.assert_not_awaited()
+
+
+class ActivationTests(unittest.IsolatedAsyncioTestCase):
+    def test_explicit_results_and_ambiguous_messages(self):
+        cases = {
+            'Чек успешно активирован': 'ACTIVATED',
+            'Вы активировали чек': 'ACTIVATED',
+            'You received 0.1 USDT': 'ACTIVATED',
+            'Вы получили 0.1$.': 'ACTIVATED',
+            'Вы получили 2,5$': 'ACTIVATED',
+            'Вы получили 0.1$. Активируйте ещё один чек': 'UNKNOWN',
+            'Чек уже активирован': 'ALREADY_ACTIVATED',
+            'Чек недействителен': 'REJECTED',
+            'Check is expired': 'REJECTED',
+            'Ваш баланс: 100 USDT': 'UNKNOWN',
+            'Активировать чек': 'UNKNOWN',
+            'Вы получили сообщение': 'UNKNOWN',
+            'Чек не активирован': 'UNKNOWN',
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(classify_activation(text), expected)
+
+    async def test_only_fresh_correlated_bot_messages_confirm_activation(self):
+        receiver = CheckReceiver()
+        receiver.client = AsyncMock()
+        receiver.bot = object()
+        updates = SimpleNamespace(updates=[SimpleNamespace(
+            message=SimpleNamespace(id=11, out=True))])
+        def message(id, text, reply=None, out=False):
+            return SimpleNamespace(id=id, raw_text=text, out=out, reply_to_msg_id=reply)
+        for messages, expected in [
+            ([message(10, 'Чек успешно активирован', 11)], 'UNKNOWN'),
+            ([message(10, 'Вы получили 0.1$.')], 'UNKNOWN'),
+            ([message(12, 'Вы получили 0.1$.')], 'ACTIVATED'),
+            ([message(12, 'Чек успешно активирован')], 'UNKNOWN'),
+            ([message(12, 'Чек успешно активирован', 11, True)], 'UNKNOWN'),
+            ([message(12, 'Чек успешно активирован', 11)], 'ACTIVATED'),
+            ([message(12, 'Чек abc успешно активирован')], 'UNKNOWN'),
+            ([message(12, 'Чек успешно активирован: abc <b>')], 'ACTIVATED'),
+            ([message(12, 'Чек недействителен', 11)], 'REJECTED'),
+            ([message(12, 'Чек уже активирован', 11)], 'ALREADY_ACTIVATED'),
+        ]:
+            receiver.client.get_messages.return_value = messages
+            with patch('worker.check_receiver.asyncio.sleep', side_effect=TimeoutError):
+                state, note = await receiver._observe_activation('abc', 10, updates)
+            self.assertEqual(state, expected)
+            self.assertNotIn('<b>', note)
+
+    async def test_read_error_does_not_claim_success(self):
+        receiver = CheckReceiver()
+        receiver.client = AsyncMock()
+        receiver.client.get_messages.side_effect = OSError('offline')
+        state, note = await receiver._observe_activation('abc', 10, SimpleNamespace(updates=[]))
+        self.assertEqual(state, 'UNKNOWN')
+        self.assertIn('не подтверждена', note)
