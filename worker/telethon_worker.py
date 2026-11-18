@@ -122,8 +122,16 @@ def extract_check_url(msg) -> Optional[str]:
         return match.group(0)
     if msg.entities:
         for entity, text in msg.get_entities_text():
+            url = getattr(entity, "url", None)
+            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
+                return url
             if "http" in text and "start=" in text:
                 return text
+    for row in getattr(msg, 'buttons', None) or []:
+        for button in row:
+            url = getattr(button, 'url', None)
+            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
+                return url
     return None
 
 async def process_account_telethon(
@@ -140,7 +148,7 @@ async def process_account_telethon(
     1. Авторизация в сессии
     2. Подписка на каналы
     3. Отправка /start <ref>
-    4. Нажатие кнопки 'Чеки' -> 'Создать чек'
+    4. Нажатие кнопки 'Checks' -> 'Create check'
     5. Проверка баланса (если 0 - алерт)
     6. Отправка в чат суммы (0.1)
     7. Отправка в чат количества активаций (1)
@@ -211,37 +219,37 @@ async def process_account_telethon(
                 await random_delay(delay_min, delay_max)
                 resp_msg = await wait_for_bot_update(client, bot_entity, resp_msg, timeout=10)
 
-        # --- 3. Переход в меню 'Чеки' ---
-        clicked_checks, _ = await click_button_with_alert(resp_msg, ["Чеки", "🧾 Чеки", "Чек"])
+        # --- 3. Переход в меню 'Checks' ---
+        clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks"])
         
         if not clicked_checks:
-            logger.info(f"[{session_name}] Кнопка Чеки не найдена, отправляем /start повторно")
+            logger.info(f"[{session_name}] Кнопка Checks не найдена, отправляем /start повторно")
             sent_start2 = await client.send_message(bot_entity, "/start")
             await random_delay(delay_min, delay_max)
             resp_msg = await wait_for_bot_update(client, bot_entity, sent_start2, timeout=10)
             if resp_msg:
-                clicked_checks, _ = await click_button_with_alert(resp_msg, ["Чеки", "🧾 Чеки", "Чек"])
+                clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks"])
 
         if not clicked_checks:
-            return "ERROR", "Не удалось найти/нажать кнопку 'Чеки'", None
+            return "ERROR", "Не удалось найти/нажать кнопку 'Checks'", None
 
-        logger.info(f"[{session_name}] Нажата кнопка 'Чеки', ожидаем меню создания чека...")
+        logger.info(f"[{session_name}] Нажата кнопка 'Checks', ожидаем меню создания чека...")
         await random_delay(delay_min, delay_max)
         resp_msg = await wait_for_bot_update(client, bot_entity, resp_msg, timeout=10)
 
-        # --- 4. Нажатие 'Создать чек' ---
-        clicked_create, alert_create = await click_button_with_alert(resp_msg, ["Создать чек", "Создать"])
+        # --- 4. Нажатие 'Create check' ---
+        clicked_create, alert_create = await click_button_with_alert(resp_msg, ["Create check"])
         if not clicked_create:
             # Проверим свежие сообщения
             messages = await client.get_messages(bot_entity, limit=2)
             for m in messages:
                 if not m.out:
-                    clicked_create, alert_create = await click_button_with_alert(m, ["Создать чек", "Создать"])
+                    clicked_create, alert_create = await click_button_with_alert(m, ["Create check"])
                     if clicked_create:
                         resp_msg = m
                         break
 
-        # Проверка алерта от бота при нажатии на кнопку "Создать чек"
+        # Проверка алерта от бота при нажатии на кнопку "Create check"
         if alert_create:
             logger.warning(f"[{session_name}] Алерт бота: {alert_create}")
             alert_lower = alert_create.lower()
@@ -249,9 +257,9 @@ async def process_account_telethon(
                 return "ERROR", f"На аккаунте нет баланса для чека: {alert_create}", None
 
         if not clicked_create:
-            return "ERROR", "Не удалось нажать кнопку 'Создать чек'", None
+            return "ERROR", "Не удалось нажать кнопку 'Create check'", None
 
-        logger.info(f"[{session_name}] Нажата кнопка 'Создать чек', ожидаем запрос суммы...")
+        logger.info(f"[{session_name}] Нажата кнопка 'Create check', ожидаем запрос суммы...")
         await random_delay(delay_min, delay_max)
         resp_msg = await wait_for_bot_update(client, bot_entity, resp_msg, timeout=10)
 
