@@ -379,7 +379,7 @@ async def cb_view_stats(callback: types.CallbackQuery):
 @router.callback_query(F.data == "view_checks")
 async def cb_view_checks(callback: types.CallbackQuery):
     """Просмотр последних чеков."""
-    if not await check_admin(callback.from_user):
+    if not receiver_admin(callback.from_user, getattr(callback.message, "chat", None)):
         return await callback.answer("Нет доступа", show_alert=True)
 
     checks = await db.get_all_checks()
@@ -394,7 +394,15 @@ async def cb_view_checks(callback: types.CallbackQuery):
     if len(checks) > 15:
         lines.append(f"\n<i>... и еще {len(checks) - 15} чеков. Нажмите кнопку выгрузки для полного списка.</i>")
 
+    check_buttons = [
+        [types.InlineKeyboardButton(
+            text=f"Получить чек №{number}",
+            callback_data=f"get_check:{check['id']}",
+        )]
+        for number, check in enumerate(last_checks, 1)
+    ]
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        *check_buttons,
         [
             types.InlineKeyboardButton(
                 text="Скачать все .txt",
@@ -417,6 +425,41 @@ async def cb_view_checks(callback: types.CallbackQuery):
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
+
+@router.callback_query(F.data.regexp(r"^(get_check|confirm_check):[0-9]{1,19}$"))
+async def cb_get_check(callback: types.CallbackQuery):
+    message = callback.message
+    if not isinstance(message, types.Message) or not receiver_admin(callback.from_user, message.chat):
+        return await callback.answer("Нет доступа", show_alert=True)
+
+    action, check_id = callback.data.split(":", 1)
+    checks = await db.get_all_checks()
+    check = next((item for item in checks if item["id"] == int(check_id)), None)
+    if check is None:
+        return await callback.answer("Чек больше не доступен.", show_alert=True)
+
+    link = escape(check["check_url"])
+    if action == "confirm_check":
+        await message.edit_text(
+            f"Чек активирован (по вашему подтверждению).\n{link}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    else:
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(
+                text="Подтвердить активацию",
+                callback_data=f"confirm_check:{check_id}",
+            )],
+        ])
+        await message.answer(
+            f"Ссылка на чек:\n{link}",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
 
 @router.callback_query(F.data == "export_checks_file")
 async def cb_export_checks(callback: types.CallbackQuery):
