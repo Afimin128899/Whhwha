@@ -17,7 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from config import BOT_TOKEN, API_POOLS
 from database.db import db
 from worker.manager import WorkerManager
-from bot.handlers import router, close_auth_clients, auth_isolation
+from bot.handlers import router, close_auth_clients, auth_isolation, close_upload_tasks
 
 # Настройка логирования
 logging.basicConfig(
@@ -71,6 +71,7 @@ async def main():
         await dp.start_polling(bot_client, worker_mgr=worker_mgr)
     finally:
         logger.info("Остановка приложения...")
+        await close_upload_tasks()
         await worker_mgr.stop()
         await close_auth_clients()
         await bot_client.session.close()

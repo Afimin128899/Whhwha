@@ -1,4 +1,6 @@
 import io
+import asyncio
+import threading
 import stat
 import tempfile
 import unittest
@@ -86,7 +88,8 @@ class UploadHandlerTests(unittest.IsolatedAsyncioTestCase):
                                        document=SimpleNamespace(file_name='sessions.zip', file_size=100))
         self.bot = AsyncMock()
         self.db = AsyncMock()
-        self.db.add_session.return_value = True
+        self.db.add_sessions.side_effect = lambda names: len(names)
+        self.addAsyncCleanup(handlers.close_upload_tasks)
         for target, value in (
             ('bot.handlers.SESSIONS_DIR', self.directory),
             ('bot.handlers.check_admin', AsyncMock(return_value=True)),
@@ -96,18 +99,23 @@ class UploadHandlerTests(unittest.IsolatedAsyncioTestCase):
             p.start()
             self.addCleanup(p.stop)
 
+    async def submit(self):
+        await handlers.handle_session_file(self.message, self.bot)
+        if handlers.upload_tasks:
+            await asyncio.gather(*list(handlers.upload_tasks))
+
     def upload(self, content):
         async def download(doc, destination):
-            destination.write(content)
+            Path(destination).write_bytes(content)
         self.bot.download.side_effect = download
 
     async def test_archive_adds_new_sessions_without_overwriting_existing(self):
         (self.directory / 'old.session').write_bytes(b'keep')
         self.upload(archive_bytes([('old.session', b'replace'), ('folder/new.session', b'new')]).getvalue())
-        await handlers.handle_session_file(self.message, self.bot)
+        await self.submit()
         self.assertEqual((self.directory / 'old.session').read_bytes(), b'keep')
         self.assertEqual((self.directory / 'new.session').read_bytes(), b'new')
-        self.db.add_session.assert_awaited_once_with('new')
+        self.db.add_sessions.assert_awaited_once_with(['new'])
         self.assertEqual(sorted(p.name for p in self.directory.iterdir()), ['new.session', 'old.session'])
         self.assertIn('Добавлено в очередь: 1', self.message.answer.call_args.args[0])
         self.assertIn('пропущено: 1', self.message.answer.call_args.args[0])
@@ -115,30 +123,102 @@ class UploadHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_individual_session_still_adds_to_queue(self):
         self.message.document.file_name = 'one.session'
         self.upload(b'one')
-        await handlers.handle_session_file(self.message, self.bot)
-        self.db.add_session.assert_awaited_once_with('one')
+        await self.submit()
+        self.db.add_sessions.assert_awaited_once_with(['one'])
 
     async def test_rejected_archive_never_changes_live_sessions(self):
         self.upload(archive_bytes([('ok.session', b'ok'), ('../bad.session', b'bad')]).getvalue())
-        await handlers.handle_session_file(self.message, self.bot)
+        await self.submit()
         self.assertEqual(list(self.directory.iterdir()), [])
-        self.db.add_session.assert_not_awaited()
+        self.db.add_sessions.assert_not_awaited()
         self.assertIn('отклонена', self.message.answer.call_args.args[0])
 
     async def test_crc_failure_does_not_install_partially_staged_archive(self):
         content = archive_bytes([('first.session', b'first'), ('second.session', b'good-data')]).getvalue()
         self.upload(content.replace(b'good-data', b'bad--data', 1))
-        await handlers.handle_session_file(self.message, self.bot)
+        await self.submit()
         self.assertEqual(list(self.directory.iterdir()), [])
-        self.db.add_session.assert_not_awaited()
+        self.db.add_sessions.assert_not_awaited()
         self.assertIn('отклонена', self.message.answer.call_args.args[0])
 
     async def test_unauthorized_user_does_not_download(self):
         with patch('bot.handlers.check_admin', AsyncMock(return_value=False)):
-            await handlers.handle_session_file(self.message, self.bot)
+            await self.submit()
         self.bot.download.assert_not_awaited()
 
     async def test_missing_filename_is_rejected(self):
         self.message.document.file_name = None
-        await handlers.handle_session_file(self.message, self.bot)
+        await self.submit()
         self.bot.download.assert_not_awaited()
+
+    async def test_slow_download_releases_user_lock_for_menu_commands(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        async def download(doc, destination):
+            started.set()
+            await release.wait()
+            Path(destination).write_bytes(archive_bytes([('one.session', b'one')]).getvalue())
+        self.bot.download.side_effect = download
+        key = 'same-admin-chat'
+        async with handlers.auth_isolation.lock(key=key):
+            await asyncio.wait_for(handlers.handle_session_file(self.message, self.bot), 1)
+        await asyncio.wait_for(started.wait(), 1)
+        async def menu_command():
+            async with handlers.auth_isolation.lock(key=key):
+                return 'menu available'
+        self.assertEqual(await asyncio.wait_for(menu_command(), 1), 'menu available')
+        self.db.add_sessions.assert_not_awaited()
+        self.assertIn('Файл принят', self.message.answer.call_args_list[0].args[0])
+        release.set()
+        await asyncio.gather(*list(handlers.upload_tasks))
+        self.db.add_sessions.assert_awaited_once_with(['one'])
+
+    async def test_download_failure_is_reported_and_queue_continues(self):
+        self.bot.download.side_effect = OSError('offline')
+        with self.assertLogs('session_uploads', level='ERROR'):
+            await self.submit()
+        self.assertIn('Не удалось загрузить файл', self.message.answer.call_args.args[0])
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.upload(archive_bytes([('one.session', b'one')]).getvalue())
+        await self.submit()
+        self.db.add_sessions.assert_awaited_once_with(['one'])
+
+    async def test_download_timeout_is_reported(self):
+        async def download(doc, destination):
+            await asyncio.Event().wait()
+        self.bot.download.side_effect = download
+        with patch('bot.handlers.UPLOAD_TIMEOUT_SECONDS', 0.001):
+            await self.submit()
+        self.assertIn('Скачивание заняло', self.message.answer.call_args.args[0])
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    async def test_queue_is_bounded_and_shutdown_cleans_pending_uploads(self):
+        async def download(doc, destination):
+            await asyncio.Event().wait()
+        self.bot.download.side_effect = download
+        with patch('bot.handlers.MAX_PENDING_UPLOADS', 1):
+            await handlers.handle_session_file(self.message, self.bot)
+            await handlers.handle_session_file(self.message, self.bot)
+        self.assertIn('Очередь загрузок заполнена', self.message.answer.call_args.args[0])
+        await handlers.close_upload_tasks()
+        self.assertFalse(handlers.upload_tasks)
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    async def test_thread_finishes_before_cancellation_cleanup(self):
+        started = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        def work():
+            loop.call_soon_threadsafe(started.set)
+            release.wait(5)
+            return 'finished'
+        task = asyncio.create_task(handlers._upload_io(work))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task

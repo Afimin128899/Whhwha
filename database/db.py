@@ -119,6 +119,21 @@ class Database:
         except aiosqlite.IntegrityError:
             return False
 
+    async def add_sessions(self, session_names: List[str]) -> int:
+        """Register an upload in one transaction, preserving duplicate sessions."""
+        if not session_names:
+            return 0
+        now = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.db_path) as connection:
+            await connection.executemany(
+                "INSERT OR IGNORE INTO sessions (session_name, status, created_at, updated_at) "
+                "VALUES (?, 'READY', ?, ?)",
+                [(name, now, now) for name in session_names],
+            )
+            added = connection.total_changes
+            await connection.commit()
+            return added
+
     async def get_next_ready_session(self) -> Optional[str]:
         """Получить следующую сессию для обработки со статусом READY."""
         async with aiosqlite.connect(self.db_path) as db:
