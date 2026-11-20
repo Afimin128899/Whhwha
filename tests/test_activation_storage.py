@@ -51,3 +51,14 @@ class ActivationStorageTests(unittest.IsolatedAsyncioTestCase):
             stats = await db.get_sessions_stats()
             self.assertEqual(stats['DONE'], 1)
             self.assertEqual(stats['READY'], 2)
+
+    async def test_repeated_history_check_does_not_duplicate_or_overwrite_amount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / 'checks.sqlite3')
+            await db.init()
+            url = 'https://t.me/send?start=one'
+            await db.add_check('one', url, 0.5)
+            await db.add_check('one', url, 0.0)
+            checks = await db.get_all_checks()
+            self.assertEqual(len(checks), 1)
+            self.assertEqual(checks[0]['amount'], 0.5)

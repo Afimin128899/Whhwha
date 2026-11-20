@@ -463,7 +463,8 @@ async def cb_view_checks(callback: types.CallbackQuery):
     last_checks = checks[:15]
     lines = [f"{tg_emoji('dollar')} <b>Последние полученные чеки:</b>\n"]
     for i, c in enumerate(last_checks, 1):
-        lines.append(f"{i}. <code>{c['session_name']}</code> | {c['amount']}$ -> {c['check_url']}\n{c.get('activation_note', 'Активация не проверялась.').splitlines()[0]}")
+        amount_label = f"{c['amount']}$" if c['amount'] else 'сумма неизвестна'
+        lines.append(f"{i}. <code>{c['session_name']}</code> | {amount_label} -> {c['check_url']}\n{c.get('activation_note', 'Активация не проверялась.').splitlines()[0]}")
 
     if len(checks) > 15:
         lines.append(f"\n<i>... и еще {len(checks) - 15} чеков. Нажмите кнопку выгрузки для полного списка.</i>")

@@ -226,3 +226,21 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         progress = [call.args[1] for call in self.bot.send_message.await_args_list
                     if call.args[1].startswith('Отправлено ')]
         self.assertEqual(progress, [])
+
+    async def test_all_checks_from_history_are_delivered_with_unknown_amount(self):
+        receiver = AsyncMock()
+        receiver.open_check.return_value = '✅ Чек активирован.'
+        async def process(session_name, **kwargs):
+            return 'DONE', 'из истории', [
+                f'https://t.me/send?start={session_name}_a',
+                f'https://t.me/send?start={session_name}_b']
+        with patch.dict('os.environ', {'CHECK_RECEIVER_ENABLED': '1'}), \
+             patch('worker.manager.ReceiverPool', return_value=receiver), \
+             patch('worker.manager.process_account_telethon', process):
+            await self.manager.start()
+            await asyncio.wait_for(self.manager._task, 10)
+        self.assertEqual(receiver.open_check.await_count, 24)
+        checks = await self.db.get_all_checks()
+        self.assertEqual(len(checks), 24)
+        self.assertTrue(all(c['amount'] == 0 for c in checks))
+        self.assertTrue(all(c['activation_note'] == '✅ Чек активирован.' for c in checks))

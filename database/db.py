@@ -199,8 +199,9 @@ class Database:
         now = datetime.utcnow().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO checks (session_name, check_url, amount, created_at) VALUES (?, ?, ?, ?)",
-                (session_name, check_url, amount, now)
+                "INSERT INTO checks (session_name, check_url, amount, created_at) "
+                "SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM checks WHERE check_url = ? AND session_name = ?)",
+                (session_name, check_url, amount, now, check_url, session_name)
             )
             await db.commit()
 

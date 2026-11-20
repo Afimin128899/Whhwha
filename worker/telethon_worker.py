@@ -3,7 +3,7 @@ import logging
 import random
 import re
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 from urllib.parse import urlparse, parse_qs
 
 from telethon import TelegramClient
@@ -17,6 +17,8 @@ from telethon.errors import (
 )
 
 from config import get_random_api_credentials, SESSIONS_DIR
+from database.db import db
+from worker.check_receiver import RECEIVER_BOT, parse_check_link
 
 logger = logging.getLogger("worker")
 
@@ -112,27 +114,50 @@ async def click_button_with_alert(msg, patterns: List[str]) -> Tuple[bool, Optio
 
     return False, None
 
-def extract_check_url(msg) -> Optional[str]:
-    """Извлечение ссылки на чек из сообщения."""
+def extract_check_urls(msg) -> List[str]:
+    """Find all start links in text, hyperlink entities and URL buttons."""
     if not msg:
-        return None
-    full_text = (msg.text or "") + "\n" + (msg.raw_text or "")
-    match = re.search(r"https://t\.me/(?:[a-zA-Z0-9_]+)\?start=([a-zA-Z0-9_-]+)", full_text)
-    if match:
-        return match.group(0)
-    if msg.entities:
+        return []
+    candidates = []
+    pattern = r"https://t\.me/[A-Za-z0-9_]+\?start=[A-Za-z0-9_-]+"
+    for text in (getattr(msg, 'text', '') or '', getattr(msg, 'raw_text', '') or ''):
+        candidates.extend(re.findall(pattern, text))
+    if getattr(msg, 'entities', None):
         for entity, text in msg.get_entities_text():
-            url = getattr(entity, "url", None)
-            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
-                return url
-            if "http" in text and "start=" in text:
-                return text
+            url = getattr(entity, 'url', None)
+            if url and re.fullmatch(pattern, url):
+                candidates.append(url)
+            if text and re.fullmatch(pattern, text):
+                candidates.append(text)
     for row in getattr(msg, 'buttons', None) or []:
         for button in row:
             url = getattr(button, 'url', None)
-            if url and re.fullmatch(r"https://t\.me/[a-zA-Z0-9_]+\?start=[a-zA-Z0-9_-]+", url):
-                return url
-    return None
+            if url and re.fullmatch(pattern, url):
+                candidates.append(url)
+    return list(dict.fromkeys(candidates))
+
+
+def extract_check_url(msg) -> Optional[str]:
+    links = extract_check_urls(msg)
+    return links[0] if links else None
+
+
+async def find_existing_checks(client, bot_entity, check_bot: str) -> List[str]:
+    """Read the full redcubebetbot history before deciding to create a new check."""
+    checks = []
+    seen = set()
+    async for message in client.iter_messages(bot_entity, limit=None, wait_time=1):
+        if message.out:
+            continue
+        for url in extract_check_urls(message):
+            try:
+                payload = parse_check_link(url, check_bot)
+            except ValueError:
+                continue
+            if payload not in seen:
+                seen.add(payload)
+                checks.append(f'https://t.me/{check_bot}?start={payload}')
+    return checks
 
 async def process_account_telethon(
     session_name: str,
@@ -142,7 +167,7 @@ async def process_account_telethon(
     check_count: str = "1",
     delay_min: float = 2.0,
     delay_max: float = 4.0
-) -> Tuple[str, str, Optional[str]]:
+) -> Tuple[str, str, Optional[Union[str, List[str]]]]:
     """
     Основной пайплайн обработки аккаунта:
     1. Авторизация в сессии
@@ -166,7 +191,7 @@ async def process_account_telethon(
 
     client = TelegramClient(
         str(session_file), api_id, api_hash,
-        lang_code="en", system_lang_code="en-US",
+        lang_code="en", system_lang_code="en-US", flood_sleep_threshold=0,
     )
 
     try:
@@ -177,6 +202,15 @@ async def process_account_telethon(
         me = await client.get_me()
         user_info = f"{me.first_name or ''} (@{me.username or me.phone})"
         logger.info(f"[{session_name}] Авторизован как: {user_info}")
+
+        # Search existing checks before any subscriptions, /start or creation buttons.
+        history_bot = await client.get_entity('redcubebetbot')
+        check_bot = await db.get_setting('check_receiver_bot', RECEIVER_BOT)
+        existing_checks = await find_existing_checks(client, history_bot, check_bot)
+        if existing_checks:
+            logger.info('[%s] Найдено чеков в истории redcubebetbot: %s',
+                        session_name, len(existing_checks))
+            return 'DONE', f'Найдено ранее созданных чеков: {len(existing_checks)}', existing_checks
 
         # --- 1. Подписка на обязательные каналы и чаты ---
         for ch in channels:
@@ -220,7 +254,7 @@ async def process_account_telethon(
                 resp_msg = await wait_for_bot_update(client, bot_entity, resp_msg, timeout=10)
 
         # --- 3. Переход в меню 'Checks' ---
-        clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks"])
+        clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks", "Чеки"])
         
         if not clicked_checks:
             logger.info(f"[{session_name}] Кнопка Checks не найдена, отправляем /start повторно")
@@ -228,7 +262,7 @@ async def process_account_telethon(
             await random_delay(delay_min, delay_max)
             resp_msg = await wait_for_bot_update(client, bot_entity, sent_start2, timeout=10)
             if resp_msg:
-                clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks"])
+                clicked_checks, _ = await click_button_with_alert(resp_msg, ["Checks", "Чеки"])
 
         if not clicked_checks:
             return "ERROR", "Не удалось найти/нажать кнопку 'Checks'", None
@@ -238,13 +272,13 @@ async def process_account_telethon(
         resp_msg = await wait_for_bot_update(client, bot_entity, resp_msg, timeout=10)
 
         # --- 4. Нажатие 'Create check' ---
-        clicked_create, alert_create = await click_button_with_alert(resp_msg, ["Create check"])
+        clicked_create, alert_create = await click_button_with_alert(resp_msg, ["Create check", "Создать чек"])
         if not clicked_create:
             # Проверим свежие сообщения
             messages = await client.get_messages(bot_entity, limit=2)
             for m in messages:
                 if not m.out:
-                    clicked_create, alert_create = await click_button_with_alert(m, ["Create check"])
+                    clicked_create, alert_create = await click_button_with_alert(m, ["Create check", "Создать чек"])
                     if clicked_create:
                         resp_msg = m
                         break
