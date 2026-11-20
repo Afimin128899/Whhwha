@@ -3,6 +3,7 @@ import os
 import io
 import re
 import asyncio
+import tempfile
 from contextlib import suppress
 from html import escape
 from pathlib import Path
@@ -36,6 +37,7 @@ from bot.keyboards import (
 )
 from bot.states import SettingsStates, AddSessionStates, ReceiverStates
 from bot.emojis import tg_emoji, emoji_id
+from bot.session_uploads import MAX_UPLOAD_BYTES, UploadError, stage_sessions
 from worker.check_receiver import (
     ReceiverPool, RECEIVER_DIR, RECEIVER_SESSION, RECEIVER_BOT, receiver_setup_lock,
     MAX_RECEIVERS, receiver_session_path, receiver_account_key,
@@ -306,7 +308,7 @@ async def cmd_start(message: types.Message, state: FSMContext, worker_mgr: Worke
     text = (
         f"<b>{tg_emoji('robot')} Панель управления фермой Telethon</b>\n\n"
         f"{tg_emoji('lightning')} <b>Статус воркера:</b> {status_text}\n\n"
-        f"{tg_emoji('idea')} <i>Вы можете отправлять файлы .session прямо в этот чат — они автоматически добавятся в очередь.</i>"
+        f"{tg_emoji('idea')} <i>Отправляй .session или .zip с сессиями прямо в этот чат — они добавятся в очередь.</i>"
     )
     await message.answer(text, reply_markup=get_main_keyboard(is_running), parse_mode=ParseMode.HTML)
 
@@ -329,7 +331,7 @@ async def cb_menu_main(callback: types.CallbackQuery, state: FSMContext | None =
     text = (
         f"<b>{tg_emoji('robot')} Панель управления фермой Telethon</b>\n\n"
         f"{tg_emoji('lightning')} <b>Статус воркера:</b> {status_text}\n\n"
-        f"{tg_emoji('idea')} <i>Вы можете отправлять файлы .session прямо в этот чат — они автоматически добавятся в очередь.</i>"
+        f"{tg_emoji('idea')} <i>Отправляй .session или .zip с сессиями прямо в этот чат — они добавятся в очередь.</i>"
     )
     try:
         await callback.message.edit_text(text, reply_markup=get_main_keyboard(is_running), parse_mode=ParseMode.HTML)
@@ -692,37 +694,44 @@ async def process_new_delays(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
-# --- ПРИЕМ ФАЙЛОВ СЕССИЙ (.session) ---
+# --- ПРИЕМ ФАЙЛОВ СЕССИЙ (.session / .zip) ---
 
 @router.message(F.document)
 async def handle_session_file(message: types.Message, bot: Bot):
-    """Автоматическое сохранение сессии при отправке документа админом."""
+    """Import individual sessions or an archive, preserving existing files."""
     if not await check_admin(message.from_user):
         return
-
     doc = message.document
-    if not doc.file_name.endswith(".session"):
-        await message.answer(
-            f"{tg_emoji('warning')} Принимаются только файлы с расширением <code>.session</code>.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    dest = SESSIONS_DIR / doc.file_name
-    await bot.download(doc, destination=dest)
-    session_name = Path(doc.file_name).stem
-    added = await db.add_session(session_name)
-
-    if added:
-        await message.answer(
-            f"{tg_emoji('check')} Сессия <code>{doc.file_name}</code> сохранена и добавлена в очередь!",
-            parse_mode=ParseMode.HTML
-        )
-    else:
-        await message.answer(
-            f"{tg_emoji('info')} Сессия <code>{doc.file_name}</code> уже была в базе данных.",
-            parse_mode=ParseMode.HTML
-        )
+    filename = doc.file_name or ''
+    if Path(filename).suffix.lower() not in ('.session', '.zip'):
+        return await message.answer('Принимаются .session и .zip с файлами сессий.')
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        return await message.answer('Максимальный размер загрузки — 20 МБ.')
+    added = skipped = 0
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as source:
+            await bot.download(doc, destination=source)
+            with tempfile.TemporaryDirectory(prefix='.upload-', dir=SESSIONS_DIR) as staging:
+                files = await asyncio.to_thread(stage_sessions, source, filename, staging)
+                for staged in files:
+                    destination = SESSIONS_DIR / staged.name
+                    try:
+                        # Atomically publish a complete file; never overwrite a live session.
+                        os.link(staged, destination)
+                    except FileExistsError:
+                        skipped += 1
+                        continue
+                    if await db.add_session(destination.stem):
+                        added += 1
+                    else:
+                        skipped += 1
+    except UploadError as exc:
+        return await message.answer(f'Загрузка отклонена: {escape(str(exc))}')
+    await message.answer(
+        f'Добавлено в очередь: {added}. Уже существуют / пропущено: {skipped}.\n'
+        'Существующие сессии не заменяются.',
+    )
 
 # --- АВТОРИЗАЦИЯ ПО НОМЕРУ И КОДУ ---
 
