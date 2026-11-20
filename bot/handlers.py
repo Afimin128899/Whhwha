@@ -4,6 +4,7 @@ import io
 import re
 import asyncio
 import tempfile
+import logging
 from contextlib import suppress
 from html import escape
 from pathlib import Path
@@ -51,6 +52,50 @@ AUTH_TIMEOUT_SECONDS = 300
 active_auth_clients: dict[int, TelegramClient] = {}
 receiver_auth_users: set[int] = set()
 auth_timeouts: dict[int, asyncio.Task] = {}
+upload_tasks: set[asyncio.Task] = set()
+upload_lock = asyncio.Lock()
+MAX_PENDING_UPLOADS = 5
+UPLOAD_TIMEOUT_SECONDS = 120
+upload_logger = logging.getLogger('session_uploads')
+
+
+async def close_upload_tasks():
+    tasks = list(upload_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    upload_tasks.difference_update(tasks)
+
+
+async def _upload_io(function, *args):
+    # Cancellation must wait for the thread before deleting its files.
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await task
+        raise
+
+
+def _stage_download(source, filename, directory):
+    with open(source, 'rb') as stream:
+        return stage_sessions(stream, filename, directory)
+
+
+def _publish_sessions(files, directory):
+    names = []
+    skipped = 0
+    for staged in files:
+        destination = directory / staged.name
+        try:
+            os.link(staged, destination)
+        except FileExistsError:
+            skipped += 1
+        else:
+            names.append(destination.stem)
+    return names, skipped
+
 
 
 async def cancel_auth(user_id: int):
@@ -707,31 +752,52 @@ async def handle_session_file(message: types.Message, bot: Bot):
         return await message.answer('Принимаются .session и .zip с файлами сессий.')
     if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
         return await message.answer('Максимальный размер загрузки — 20 МБ.')
-    added = skipped = 0
+    if len(upload_tasks) >= MAX_PENDING_UPLOADS:
+        return await message.answer('Очередь загрузок заполнена. Дождись результата предыдущих файлов.')
+    await message.answer('Файл принят в очередь загрузки. Меню доступно; результат пришлю отдельно.')
+    task = asyncio.create_task(_run_session_upload(message, bot, doc, filename))
+    upload_tasks.add(task)
+    task.add_done_callback(upload_tasks.discard)
+
+
+async def _run_session_upload(message, bot, doc, filename):
     try:
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as source:
-            await bot.download(doc, destination=source)
+        async with upload_lock:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix='.upload-', dir=SESSIONS_DIR) as staging:
-                files = await asyncio.to_thread(stage_sessions, source, filename, staging)
-                for staged in files:
-                    destination = SESSIONS_DIR / staged.name
-                    try:
-                        # Atomically publish a complete file; never overwrite a live session.
-                        os.link(staged, destination)
-                    except FileExistsError:
-                        skipped += 1
-                        continue
-                    if await db.add_session(destination.stem):
-                        added += 1
-                    else:
-                        skipped += 1
+                staging = Path(staging)
+                source = staging / 'download'
+                # A path destination makes aiogram write through aiofiles.
+                async with asyncio.timeout(UPLOAD_TIMEOUT_SECONDS):
+                    await bot.download(doc, destination=source)
+                files_dir = staging / 'files'
+                files_dir.mkdir()
+                files = await _upload_io(_stage_download, source, filename, files_dir)
+                names, skipped = await _upload_io(_publish_sessions, files, SESSIONS_DIR)
+                added = await db.add_sessions(names)
+                skipped += len(names) - added
+        await message.answer(
+            f'Файл <code>{escape(filename)}</code>\nДобавлено в очередь: {added}. '
+            f'Уже существуют / пропущено: {skipped}.\nСуществующие сессии не заменяются.',
+            parse_mode=ParseMode.HTML,
+        )
     except UploadError as exc:
-        return await message.answer(f'Загрузка отклонена: {escape(str(exc))}')
-    await message.answer(
-        f'Добавлено в очередь: {added}. Уже существуют / пропущено: {skipped}.\n'
-        'Существующие сессии не заменяются.',
-    )
+        await _report_upload_error(message, f'Загрузка отклонена: {escape(str(exc))}')
+    except TimeoutError:
+        await _report_upload_error(message, 'Скачивание заняло больше 120 секунд. Отправь файл ещё раз.')
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        upload_logger.error('Ошибка импорта сессий: %s', type(exc).__name__)
+        await _report_upload_error(message,
+            'Не удалось загрузить файл. Проверь соединение и свободное место на сервере, затем повтори.')
+
+
+async def _report_upload_error(message, text):
+    try:
+        await message.answer(text)
+    except Exception as exc:
+        upload_logger.error('Не удалось сообщить об ошибке загрузки: %s', type(exc).__name__)
 
 # --- АВТОРИЗАЦИЯ ПО НОМЕРУ И КОДУ ---
 

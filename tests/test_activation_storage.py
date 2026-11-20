@@ -39,3 +39,15 @@ class ActivationStorageTests(unittest.IsolatedAsyncioTestCase):
             await db.init()
             self.assertEqual(await db.get_setting('worker_count'), '10')
             self.assertEqual(await db.get_setting('sequential_accounts'), '1')
+
+    async def test_bulk_session_import_preserves_duplicates_and_existing_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / 'sessions.sqlite3')
+            await db.init()
+            await db.add_session('existing')
+            await db.update_session_status('existing', 'DONE', 'finished')
+            self.assertEqual(await db.add_sessions(['existing', 'one', 'two', 'one']), 2)
+            self.assertEqual(await db.add_sessions([]), 0)
+            stats = await db.get_sessions_stats()
+            self.assertEqual(stats['DONE'], 1)
+            self.assertEqual(stats['READY'], 2)
