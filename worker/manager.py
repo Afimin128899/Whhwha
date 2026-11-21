@@ -156,9 +156,11 @@ class WorkerManager:
                 # Фиксируем статус в БД
                 await db.update_session_status(session_name, status, details)
 
-                # Если чек получен
-                if check_url:
-                    amount_float = float(check_amount) if check_amount.replace('.', '', 1).isdigit() else 0.1
+                history_checks = isinstance(check_url, list)
+                check_urls = check_url if history_checks else ([check_url] if check_url else [])
+                for check_url in check_urls:
+                    amount_float = 0.0 if history_checks else (float(check_amount) if check_amount.replace('.', '', 1).isdigit() else 0.1)
+                    amount_label = 'неизвестна (чек из истории)' if history_checks else f'{check_amount}$'
                     await db.add_check(session_name, check_url, amount_float)
 
                     receiver_note = "Активация не проверялась: получатель выключен."
@@ -182,7 +184,7 @@ class WorkerManager:
                             text = (
                                 f"{tg_emoji('party')} <b>Новый чек получен!</b>\n\n"
                                 f"{tg_emoji('user')} <b>Сессия:</b> <code>{session_name}</code>\n"
-                                f"{tg_emoji('money')} <b>Сумма:</b> <code>{check_amount}$</code>\n"
+                                f"{tg_emoji('money')} <b>Сумма:</b> <code>{amount_label}</code>\n"
                                 f"{tg_emoji('link')} <b>Чек:</b>\n{check_url}\n{receiver_note}"
                             )
                             await self.bot.send_message(
